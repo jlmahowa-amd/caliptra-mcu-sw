@@ -413,19 +413,20 @@ pub fn download_bitstream_pdi<P: AsRef<Path>>(
     manifest: P,
 ) -> Result<()> {
     // Assumes bitstream file is placed in the current directory.
-    let bitstream = caliptra_bitstream_downloader::download_bitstream(manifest.as_ref())?;
+    //let bitstream = caliptra_bitstream_downloader::download_bitstream(manifest.as_ref())?;
 
     if let Some(target_host) = target_host {
         rsync_file(
             target_host,
-            &bitstream.display().to_string(),
+            "/mnt/c/Users/jlmahowa/Downloads/copy_fpga_segmented/runtime_8df1c641.pdi", //&bitstream.display().to_string(),
+            //"/mnt/c/Users/jlmahowa/Downloads/copy_fpga_segmented/runtime_8df1c641_debug.pdi",
             "caliptra-bitstream.pdi",
             false,
         )
         .context("failed to copy tests to fpga")?;
-    } else {
-        std::fs::rename(&bitstream, "caliptra-bitstream.pdi").context("rename bitstream pdi")?;
-    }
+    }// else {
+    //    std::fs::rename(&bitstream, "caliptra-bitstream.pdi").context("rename bitstream pdi")?;
+    //}
 
     run_command(target_host, "sudo mkdir -p /lib/firmware")?;
     run_command(target_host, "sudo mv caliptra-bitstream.pdi /lib/firmware")?;

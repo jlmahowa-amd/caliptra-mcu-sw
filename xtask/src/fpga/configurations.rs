@@ -172,12 +172,12 @@ impl<'a> ActionHandler<'a> for Subsystem {
             return Ok(());
         }
 
-        let subsystem_bitstream = PROJECT_ROOT
-            .join("hw")
-            .join("fpga")
-            .join("bitstream_manifests")
-            .join("subsystem.toml");
-        download_bitstream_pdi(self.target_host.as_deref(), &subsystem_bitstream)?;
+        //let subsystem_bitstream = PROJECT_ROOT
+        //    .join("hw")
+        //    .join("fpga")
+        //    .join("bitstream_manifests")
+        //    .join("subsystem.toml");
+        //download_bitstream_pdi(self.target_host.as_deref(), &subsystem_bitstream)?;
         Ok(())
     }
 
