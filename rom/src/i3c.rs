@@ -122,6 +122,7 @@ impl I3c {
         }
 
         // program a static address
+        romtime::println!("doop");
         romtime::println!("[mcu-rom-i3c] Setting static address to {:x}", addr);
         regs.stdby_ctrl_mode_stby_cr_device_addr.write(
             StbyCrDeviceAddr::StaticAddrValid::SET + StbyCrDeviceAddr::StaticAddr.val(addr as u32),
@@ -165,8 +166,9 @@ impl I3c {
         regs.i3c_base_hc_control.modify(
             HcControl::ModeSelector::SET +
                 // clear is bus enabled, set is suspended
-                HcControl::BusEnable::CLEAR,
+                HcControl::BusEnable::SET,
         );
+        romtime::println!("DOOP DOOP SET BusEnable");
     }
 
     pub fn disable_recovery(&mut self) {
