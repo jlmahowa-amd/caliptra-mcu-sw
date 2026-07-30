@@ -1,0 +1,17 @@
+# Licensed under the Apache-2.0 license
+
+[package]
+name = "caliptra-mcu-bare-metal"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[dependencies]
+caliptra-mcu-bare-metal-io = { workspace = true }
+
+[target.'cfg(target_arch = "riscv32")'.dependencies]
+rv32i.workspace = true
+
+[features]
+default = []
+fpga = ["caliptra-mcu-bare-metal-io/fpga"]

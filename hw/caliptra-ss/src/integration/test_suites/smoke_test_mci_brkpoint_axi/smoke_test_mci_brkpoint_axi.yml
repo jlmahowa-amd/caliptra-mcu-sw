@@ -1,0 +1,11 @@
+---
+seed: 1
+testname: smoke_test_mci_brkpoint_axi
+pre-exec: |
+  set -eu
+  echo "Running pre_exec for [smoke_test_mci_brkpoint_axi]"
+  make -f $CALIPTRA_SS_ROOT/tools/scripts/Makefile TESTNAME=smoke_test_mci_brkpoint_axi CALIPTRA_TESTNAME=cptra_smoke_test_mci_brkpoint_axi CALIPTRA_AUX=soc_ifc_ss mcu_program.hex cptra_program.hex
+plusargs:
+    - '+cptra_ss_sv_test=SMOKE_TEST_MCI_BRKPOINT_AXI'
+    - '+MCI_BOOT_FSM_BRKPOINT_SET'
+

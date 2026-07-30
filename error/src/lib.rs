@@ -1,0 +1,937 @@
+// Licensed under the Apache-2.0 license
+
+#![cfg_attr(target_arch = "riscv32", no_std)]
+
+use core::convert::From;
+use core::num::{NonZeroU32, TryFromIntError};
+
+/// MCU Error Type
+/// Derives debug, copy, clone, eq, and partial eq
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct McuError(pub NonZeroU32);
+
+/// Macro to define error constants ensuring uniqueness
+///
+/// This macro takes a list of (name, value, doc) tuples and generates
+/// constant definitions for each error code.
+#[macro_export]
+macro_rules! define_error_constants {
+    ($(($name:ident, $value:expr, $doc:expr)),* $(,)?) => {
+        $(
+            #[doc = $doc]
+            pub const $name: McuError = McuError::new_const($value);
+        )*
+
+        #[cfg(test)]
+        /// Returns a vector of all defined error constants for testing uniqueness
+        pub fn all_constants() -> Vec<(& 'static str, u32)> {
+            vec![
+                $(
+                    (stringify!($name), $value),
+                )*
+            ]
+        }
+    };
+}
+
+impl McuError {
+    /// Create a MCU error; intended to only be used from const contexts, as we don't want
+    /// runtime panics if val is zero. The preferred way to get a McuError from a u32 is to
+    /// use `McuError::try_from()` from the `TryFrom` trait impl.
+    const fn new_const(val: u32) -> Self {
+        match NonZeroU32::new(val) {
+            Some(val) => Self(val),
+            None => panic!("McuError cannot be 0"),
+        }
+    }
+
+    /// Create an MCU error; intended to be used by vendors for vendor specific errors
+    pub const fn new_vendor(val: u32) -> Self {
+        Self(NonZeroU32::new(0xf000_0000 | val).unwrap())
+    }
+
+    // Use the macro to define all error constants
+    define_error_constants![
+        (
+            ROM_COLD_BOOT_CALIPTRA_FATAL_ERROR_BEFORE_MB_READY,
+            0x1_0000,
+            "Cold boot Caliptra fatal error before mailbox was ready"
+        ),
+        (
+            ROM_COLD_BOOT_START_RI_DOWNLOAD_ERROR,
+            0x1_0001,
+            "Cold boot failed to start recovery interface download"
+        ),
+        (
+            ROM_COLD_BOOT_FINISH_RI_DOWNLOAD_ERROR,
+            0x1_0002,
+            "Cold boot failed to finish recovery interface download"
+        ),
+        (
+            ROM_COLD_BOOT_LOAD_IMAGE_ERROR,
+            0x1_0003,
+            "Cold boot failed to load firmware image"
+        ),
+        (
+            ROM_COLD_BOOT_HEADER_VERIFY_ERROR,
+            0x1_0004,
+            "Cold boot failed to verify firmware image header"
+        ),
+        (
+            ROM_COLD_BOOT_INVALID_FIRMWARE,
+            0x1_0005,
+            "Cold boot firmware is invalid"
+        ),
+        (
+            ROM_COLD_BOOT_RESET_ERROR,
+            0x1_0006,
+            "Cold boot reset to firmware boot error"
+        ),
+        (
+            ROM_COLD_BOOT_FIELD_ENTROPY_PROG_START_MBOX_CMD_FAILED,
+            0x1_0007,
+            "Cold boot failed to start field entropy program (mailbox command failed)"
+        ),
+        (
+            ROM_COLD_BOOT_FIELD_ENTROPY_PROG_FINISH_MBOX_CMD_FAILED,
+            0x1_0008,
+            "Cold boot failed to finish field entropy program (mailbox command failed)"
+        ),
+        (
+            ROM_FW_BOOT_INVALID_FIRMWARE,
+            0x1_0009,
+            "Firmware boot reset invalid firmware"
+        ),
+        (
+            ROM_FW_HITLESS_UPDATE_CLEAR_MB_CMD_FAILED,
+            0x1_000a,
+            "Hitless update failed to clear the Caliptra mailbox (command failed)"
+        ),
+        (
+            ROM_WARM_BOOT_INVALID_FIRMWARE,
+            0x1_000b,
+            "Warm boot invalid firmware"
+        ),
+        (ROM_WARM_BOOT_RESET_ERROR, 0x1000c, "Warm boot reset error"),
+        (
+            ROM_ROM_INVALID_RESET_REASON,
+            0x1_000d,
+            "Invalid reset reason"
+        ),
+        (
+            ROM_DOT_DERIVE_STABLE_KEY_FAILED,
+            0x1_000e,
+            "Device Ownership Transfer failed to derive stable key"
+        ),
+        (
+            ROM_COLD_BOOT_DOT_BLOB_CORRUPT_ERROR,
+            0x1_000f,
+            "Device Ownership Transfer corrupt blob"
+        ),
+        (
+            ROM_COLD_BOOT_RECOVERY_NOT_CONFIGURED_ERROR,
+            0x1_0010,
+            "Recovery boot mechanism not configured"
+        ),
+        (
+            ROM_DOT_RECOVERY_BLOB_AUTH_ERROR,
+            0x1_001a,
+            "DOT recovery blob authentication failed"
+        ),
+        (
+            ROM_DOT_RECOVERY_FLASH_WRITE_ERROR,
+            0x1_001b,
+            "DOT recovery flash write failed"
+        ),
+        (
+            ROM_DOT_OVERRIDE_CHALLENGE_FAILED,
+            0x1_001c,
+            "DOT override challenge failed"
+        ),
+        (
+            ROM_DOT_OVERRIDE_SIG_VERIFY_FAILED,
+            0x1_001d,
+            "DOT override signature verification failed"
+        ),
+        (
+            ROM_DOT_OVERRIDE_NOT_LOCKED,
+            0x1_001e,
+            "DOT override requested but device not in locked state"
+        ),
+        (
+            ROM_DOT_OVERRIDE_NO_RECOVERY_PK_HASH,
+            0x1_001f,
+            "DOT override no vendor recovery PK hash in OTP fuses"
+        ),
+        (
+            ROM_DOT_RECOVERY_TRANSPORT_ERROR,
+            0x1_0020,
+            "DOT recovery transport error"
+        ),
+        (
+            ROM_DOT_OVERRIDE_PK_HASH_MISMATCH,
+            0x1_0021,
+            "DOT override vendor recovery PK hash mismatch"
+        ),
+        (
+            ROM_COLD_BOOT_HEK_REPORT_ERROR,
+            0x1_0016,
+            "Failed to report HEK state"
+        ),
+        (
+            ROM_DOT_INSTALL_OWNER_PK_HASH_FAILED,
+            0x1_003d,
+            "INSTALL_OWNER_PK_HASH mailbox command failed"
+        ),
+        (
+            ROM_DOT_FORCE_FUSE_OWNER_NOT_PROVISIONED,
+            0x1_003e,
+            "Forced fuse owner requested but CPTRA_SS_OWNER_PK_HASH is not provisioned"
+        ),
+        (
+            ROM_LC_TRANSITION_ERROR,
+            0x2_0000,
+            "Lifecycle transition error"
+        ),
+        (ROM_LC_TOKEN_ERROR, 0x2_0001, "Lifecycle token error"),
+        (ROM_LC_OTP_ERROR, 0x2_0002, "Lifecycle OTP error"),
+        (
+            ROM_LC_FLASH_RMA_ERROR,
+            0x2_0003,
+            "Lifecycle flash RMA error"
+        ),
+        (
+            ROM_LC_TRANSITION_COUNT_ERROR,
+            0x2_0004,
+            "Lifecycle transition count error"
+        ),
+        (ROM_LC_STATE_ERROR, 0x2_0005, "Lifecycle state error"),
+        (
+            ROM_LC_BUS_INTEG_ERROR,
+            0x2_0006,
+            "Lifecycle bus integrity error"
+        ),
+        (
+            ROM_LC_OTP_PARTITION_ERROR,
+            0x2_0007,
+            "Lifecycle OTP partition error"
+        ),
+        (
+            ROM_FIPS_ZEROIZATION_LC_TRANSITION_ERROR,
+            0x2_0008,
+            "FIPS zeroization lifecycle transition to SCRAP failed"
+        ),
+        (
+            ROM_FIPS_ZEROIZATION_UDS_FE_START_ERROR,
+            0x2_0009,
+            "FIPS zeroization failed to start ZEROIZE_UDS_FE command"
+        ),
+        (
+            ROM_FIPS_ZEROIZATION_UDS_FE_FINISH_ERROR,
+            0x2_000a,
+            "FIPS zeroization failed to finish ZEROIZE_UDS_FE command"
+        ),
+        (
+            ROM_FIPS_ZEROIZATION_WRITE_FIELD_ENTROPY_STATE_ZEROIZED_ERROR,
+            0x2_000b,
+            "FIPS zeroization failed to write FIELD_ENTROPY_STATE (zeroized) to OTP"
+        ),
+        (
+            ROM_FIPS_ZEROIZATION_READ_FIELD_ENTROPY_STATE_ERROR,
+            0x2_000c,
+            "FIPS zeroization failed to read FIELD_ENTROPY_STATE from OTP"
+        ),
+        (
+            ROM_OTP_INIT_STATUS_ERROR,
+            0x3_0000,
+            "OTP controller status error during initialization"
+        ),
+        (
+            ROM_OTP_INIT_NOT_IDLE,
+            0x3_0001,
+            "OTP controller not idle during initialization"
+        ),
+        (
+            ROM_OTP_INVALID_DATA_ERROR,
+            0x3_0002,
+            "OTP invalid data error"
+        ),
+        (ROM_OTP_READ_ERROR, 0x3_0003, "Failed to read from OTP"),
+        (
+            ROM_OTP_WRITE_DWORD_ERROR,
+            0x3_0004,
+            "Failed to write dword to OTP"
+        ),
+        (
+            ROM_OTP_WRITE_WORD_ERROR,
+            0x3_0005,
+            "Failed to write word to OTP"
+        ),
+        (
+            ROM_OTP_FINALIZE_DIGEST_ERROR,
+            0x3_0006,
+            "Failed to finalize digest"
+        ),
+        (
+            ROM_UNSUPPORTED_FUSE_LAYOUT,
+            0x3_0007,
+            "Unsupported layout for fuse extraction"
+        ),
+        (
+            ROM_FUSE_LAYOUT_TOO_LARGE,
+            0x3_0008,
+            "Fuse layout too large for data"
+        ),
+        (
+            ROM_FUSE_LAYOUT_ONE_HOT_RESULT_SHOULD_BE_SINGLE_U32,
+            0x3_0009,
+            "One-hot encoded output should be single u32"
+        ),
+        (
+            ROM_FUSE_VALUE_TOO_LARGE,
+            0x3_000a,
+            "Fuse value too large for layout"
+        ),
+        (
+            ROM_OTP_PENDING_TIMEOUT,
+            0x3_000b,
+            "OTP pending check exceeded maximum iterations"
+        ),
+        (
+            ROM_OTP_OCP_LOCK_FAILURE,
+            0x3_000c,
+            "OTP failure in OCP LOCK"
+        ),
+        (
+            ROM_OTP_FUSE_INVALID_PARTITION,
+            0x3_000d,
+            "OTP fuse provisioning: invalid partition"
+        ),
+        (
+            ROM_OTP_FUSE_READ_ENTRY_OUT_OF_BOUNDS,
+            0x3_000e,
+            "OTP fuse provisioning: read entry out of bounds"
+        ),
+        (
+            ROM_MCI_MBOX_FUSE_REQ_INVALID_LENGTH,
+            0x3_000f,
+            "MCI mailbox fuse request invalid length"
+        ),
+        (
+            ROM_OTP_FUSE_INVALID_START_BIT,
+            0x3_0010,
+            "OTP fuse provisioning: invalid start bit"
+        ),
+        (
+            ROM_OTP_FUSE_DAI_READ_ERROR,
+            0x3_0011,
+            "OTP fuse provisioning: DAI read error"
+        ),
+        (
+            ROM_OTP_FUSE_DAI_WRITE_ERROR,
+            0x3_0012,
+            "OTP fuse provisioning: DAI write error"
+        ),
+        (
+            ROM_OTP_FUSE_LOCK_ERROR,
+            0x3_0013,
+            "OTP fuse provisioning: partition lock error"
+        ),
+        (
+            ROM_OTP_FUSE_SECRET_READ_DENIED,
+            0x3_0014,
+            "OTP fuse provisioning: secret partition read denied"
+        ),
+        (
+            ROM_OTP_FUSE_BIT_CLEAR_NOT_ALLOWED,
+            0x3_0015,
+            "OTP fuse provisioning: bit clear not allowed"
+        ),
+        (
+            ROM_OTP_FUSE_CHECKSUM_ERROR,
+            0x3_0016,
+            "OTP fuse provisioning: request checksum error"
+        ),
+        (
+            ROM_OTP_FUSE_DATA_TOO_LARGE,
+            0x3_0017,
+            "OTP fuse provisioning: data too large"
+        ),
+        (
+            ROM_MCI_MBOX_FUSE_WRITE_HDR_TOO_SHORT,
+            0x3_0018,
+            "MCI mailbox fuse write header too short"
+        ),
+        (
+            ROM_MCI_MBOX_UNKNOWN_COMMAND,
+            0x3_0019,
+            "OTP fuse provisioning: unknown command"
+        ),
+        (
+            ROM_OTP_DIGEST_VERIFY_ERROR,
+            0x3_001a,
+            "OTP SW digest readback verification failed"
+        ),
+        (
+            ROM_OTP_READ_CPTRA_ITRNG_WINDOW_SIZE_ERROR,
+            0x3_001b,
+            "Failed to read CPTRA_ITRNG_WINDOW_SIZE from OTP"
+        ),
+        (
+            ROM_OTP_READ_CPTRA_ITRNG_CONFIG0_ERROR,
+            0x3_001c,
+            "Failed to read CPTRA_ITRNG_ENTROPY_CONFIG_0 from OTP"
+        ),
+        (
+            ROM_OTP_READ_CPTRA_ITRNG_CONFIG1_ERROR,
+            0x3_001d,
+            "Failed to read CPTRA_ITRNG_ENTROPY_CONFIG_1 from OTP"
+        ),
+        (
+            ROM_MCI_MBOX_FUSE_READ_REQ_INVALID_LENGTH,
+            0x3_001E,
+            "MCI mailbox fuse read request invalid length"
+        ),
+        (
+            ROM_MCI_MBOX_FUSE_READ_REQ_PARSE_FAILED,
+            0x3_001F,
+            "MCI mailbox fuse read request parse failed"
+        ),
+        (
+            ROM_MCI_MBOX_FUSE_READ_RESP_PARSE_FAILED,
+            0x3_0020,
+            "MCI mailbox fuse read response parse failed"
+        ),
+        (
+            ROM_MCI_MBOX_FUSE_WRITE_REQ_PARSE_FAILED,
+            0x3_0021,
+            "MCI mailbox fuse write request parse failed"
+        ),
+        (
+            ROM_MCI_MBOX_FUSE_WRITE_DLEN_OVERFLOW,
+            0x3_0022,
+            "MCI mailbox fuse write expected length overflow"
+        ),
+        (
+            ROM_MCI_MBOX_FUSE_WRITE_INPUT_TOO_LONG,
+            0x3_0023,
+            "MCI mailbox fuse write input too long"
+        ),
+        (
+            ROM_MCI_MBOX_FUSE_LOCK_REQ_INVALID_LENGTH,
+            0x3_0024,
+            "MCI mailbox fuse lock request invalid length"
+        ),
+        (
+            ROM_MCI_MBOX_FUSE_LOCK_REQ_PARSE_FAILED,
+            0x3_0025,
+            "MCI mailbox fuse lock request parse failed"
+        ),
+        (
+            ROM_OTP_FUSE_WRITE_LEN_ZERO,
+            0x3_0026,
+            "OTP fuse write length is zero"
+        ),
+        (
+            ROM_OTP_FUSE_WRITE_DATA_LEN_TOO_SHORT,
+            0x3_0027,
+            "OTP fuse write data length too short"
+        ),
+        (
+            ROM_OTP_FUSE_WRITE_ENTRY_OUT_OF_BOUNDS,
+            0x3_0028,
+            "OTP fuse write entry out of bounds or unaligned"
+        ),
+        (
+            ROM_OTP_FUSE_WRITE_OVERFLOW,
+            0x3_0029,
+            "OTP fuse write overflow: start_bit + length wraps u32"
+        ),
+        (
+            ROM_OTP_FUSE_WRITE_OUT_OF_BOUNDS,
+            0x3_002A,
+            "OTP fuse write out of bounds"
+        ),
+        (
+            ROM_MCI_MBOX_FUSE_WRITE_DATA_TOO_SHORT,
+            0x3_002B,
+            "MCI mailbox fuse write data too short"
+        ),
+        (
+            ROM_OTP_PARTITION_NO_SW_DIGEST,
+            0x3_002C,
+            "OTP partition does not support software digest"
+        ),
+        (
+            ROM_OTP_PARTITION_TOO_SMALL_FOR_DIGEST,
+            0x3_002D,
+            "OTP partition is too small for digest"
+        ),
+        (
+            ROM_OTP_PARTITION_NOT_8BYTE_ALIGNED_FOR_DIGEST,
+            0x3_002E,
+            "OTP partition data is not 8-byte aligned for digest"
+        ),
+        (
+            ROM_OTP_PARTITION_NO_DIGEST_OFFSET,
+            0x3_002F,
+            "OTP partition does not have a digest offset"
+        ),
+        (
+            ROM_OTP_FUSE_INPUT_TOO_SHORT,
+            0x3_0030,
+            "OTP fuse provisioning: input too short"
+        ),
+        (
+            ROM_OTP_FUSE_INVALID_LENGTH,
+            0x3_0031,
+            "OTP fuse provisioning: invalid length"
+        ),
+        (
+            ROM_I3C_CONFIG_RING_HEADER_ERROR,
+            0x4_0000,
+            "I3C config ring header error"
+        ),
+        (
+            ROM_I3C_CONFIG_STDBY_CTRL_MODE_ERROR,
+            0x4_0001,
+            "I3C config standby controller mode error"
+        ),
+        (
+            SOC_FMC_KEY_MANIFEST_SVN_LEN_MISMATCH,
+            0x5_0000,
+            "SOC FMC key manifest SVN length mismatch"
+        ),
+        (
+            ROM_SOC_KEY_MANIFEST_PK_HASH_LEN_MISMATCH,
+            0x5_0001,
+            "SOC key manifest PK hash length mismatch"
+        ),
+        (
+            ROM_SOC_RT_SVN_LEN_MISMATCH,
+            0x5_0002,
+            "Runtime SVN length mismatch"
+        ),
+        (
+            ROM_SOC_MANIFEST_SVN_LEN_MISMATCH,
+            0x5_0003,
+            "SOC Manifest SVN length mismatch"
+        ),
+        (
+            SOC_MANIFEST_MAX_SVN_LEN_MISMATCH,
+            0x5_0004,
+            "SOC Manifest Max SVN length mismatch"
+        ),
+        (
+            ROM_SOC_MANUF_DEBUG_UNLOCK_TOKEN_LEN_MISMATCH,
+            0x5_0005,
+            "SOC manuf debug unlock token length mismatch"
+        ),
+        (
+            ROM_SOC_STEPPING_ID_LEN_MISMATCH,
+            0x5_0006,
+            "SOC stepping ID length mismatch"
+        ),
+        (
+            ROM_SOC_ANTI_ROLLBACK_DISABLE_LEN_MISMATCH,
+            0x5_0007,
+            "SOC stepping ID length mismatch"
+        ),
+        (
+            ROM_SOC_IDEVID_CERT_ATTR_LEN_MISMATCH,
+            0x5_0008,
+            "SOC IDevID Cert Attr length mismatch"
+        ),
+        (
+            ROM_SOC_IDEVID_MANUF_HSM_ID_LEN_MISMATCH,
+            0x5_0009,
+            "SOC IDevID Manuf HSM ID length mismatch"
+        ),
+        (
+            ROM_SOC_PROD_DEBUG_UNLOCK_PKS_HASH_LEN_MISMATCH,
+            0x5_000A,
+            "SOC Prod Debug Unlock PKS Hash length mismatch"
+        ),
+        (
+            ROM_SOC_CALIPTRA_FATAL_ERROR_BEFORE_FW_READY,
+            0x5_000B,
+            "SOC Caliptra fatal error before firmware ready"
+        ),
+        (
+            ROM_SOC_MBOX_USER_OUT_OF_RANGE,
+            0x5_000C,
+            "SOC tried to set an Mbox user out of range"
+        ),
+        (
+            ROM_SOC_MBOX_USER_LOCK_OUT_OF_RANGE,
+            0x5_000D,
+            "SOC tried to lock an Mbox user out of range"
+        ),
+        (
+            ROM_SOC_PK_HASH_VERIFY_MISMATCH,
+            0x5_000E,
+            "Production debug unlock PK hash verification failed (mismatch)"
+        ),
+        (
+            ROM_SOC_MCU_MBOX0_AXI_USER_VERIFY_FAILED,
+            0x5_000F,
+            "MCU mailbox 0 AXI user verification failed after locking"
+        ),
+        (
+            ROM_SOC_SS_CONFIG_DONE_VERIFY_FAILED,
+            0x5_0010,
+            "SS_CONFIG_DONE or SS_CONFIG_DONE_STICKY verification failed after setting"
+        ),
+        (
+            ROM_SOC_UDS_SEED_LEN_MISMATCH,
+            0x5_0011,
+            "SOC UDS seed length mismatch"
+        ),
+        (
+            ROM_SOC_FIELD_ENTROPY_LEN_MISMATCH,
+            0x5_0012,
+            "SOC field entropy length mismatch"
+        ),
+        (
+            ROM_COLD_BOOT_ENCRYPTED_FW_DECRYPT_DMA_START_FAILED,
+            0x1_0011,
+            "Cold boot encrypted firmware decrypt DMA start error"
+        ),
+        (
+            ROM_COLD_BOOT_ENCRYPTED_FW_DECRYPT_DMA_FINISH_FAILED,
+            0x1_0012,
+            "Cold boot encrypted firmware decrypt DMA finish error"
+        ),
+        (
+            ROM_COLD_BOOT_ENCRYPTED_FW_DECRYPT_TAG_MISMATCH,
+            0x1_0013,
+            "Cold boot encrypted firmware GCM tag verification failed"
+        ),
+        (
+            ROM_COLD_BOOT_ENCRYPTED_FW_ACTIVATE_START_FAILED,
+            0x1_0014,
+            "Cold boot encrypted firmware activate start error"
+        ),
+        (
+            ROM_COLD_BOOT_ENCRYPTED_FW_ACTIVATE_FINISH_FAILED,
+            0x1_0015,
+            "Cold boot encrypted firmware activate finish error"
+        ),
+        (
+            ROM_COLD_BOOT_ROM_DIGEST_MISMATCH,
+            0x1_0017,
+            "Cold boot ROM integrity check failed"
+        ),
+        (
+            ROM_FW_MANIFEST_DOT_CHECKSUM_MISMATCH,
+            0x1_0018,
+            "Firmware manifest DOT checksum mismatch"
+        ),
+        (
+            OCP_LOCK_ROM_MISSING_CONFIG,
+            0x1_0019,
+            "Missing OCP LOCK ROM Config"
+        ),
+        (
+            ROM_STABLE_OWNER_KEY_DERIVATION_FAILED,
+            0x1_0022,
+            "Stable owner key derivation failed during cold boot"
+        ),
+        (
+            ROM_SOC_WDT_CFG_OUT_OF_RANGE,
+            0x5_0013,
+            "Caliptra WDT config index out of range"
+        ),
+        (
+            ROM_BOOTFSM_TIMEOUT,
+            0x5_0014,
+            "Caliptra Core boot FSM timed out"
+        ),
+        (
+            ROM_PK_HASH_SELECTION_FAILED,
+            0x5_0015,
+            "Failed to select a valid and functional vendor PK slot"
+        ),
+        (
+            ROM_SOC_ICCM_ECC_UNC,
+            0x5_0016,
+            "ICCM uncorrectable ECC error"
+        ),
+        (
+            ROM_SOC_DCCM_ECC_UNC,
+            0x5_0017,
+            "DCCM uncorrectable ECC error"
+        ),
+        (ROM_CFI_PANIC, 0x6_0000, "ROM CFI panic"),
+        (
+            ROM_CFI_NO_EARLY_ENTROPY_SOURCE,
+            0x6_0001,
+            "CFI enabled but no early entropy source available"
+        ),
+        (
+            ROM_SOC_MCU_MBOX0_AXI_USER_LOCK_VERIFY_FAILED,
+            0x5_0018,
+            "MCU mailbox 0 AXI user lock verification failed after locking"
+        ),
+        (
+            ROM_SOC_MCU_MBOX1_AXI_USER_VERIFY_FAILED,
+            0x5_0019,
+            "MCU mailbox 1 AXI user verification failed after locking"
+        ),
+        (
+            ROM_SOC_MCU_MBOX1_AXI_USER_LOCK_VERIFY_FAILED,
+            0x5_001A,
+            "MCU mailbox 1 AXI user lock verification failed after locking"
+        ),
+        (
+            ROM_DOT_HMAC_FAILED,
+            0x1_0023,
+            "DOT blob HMAC verification failed"
+        ),
+        (
+            ROM_DOT_NO_MORE_FUSE_BITS,
+            0x1_0024,
+            "No more DOT fuse bits available"
+        ),
+        (
+            ROM_DOT_FLASH_WRITE_FAILED,
+            0x1_0025,
+            "Failed to write DOT blob to flash"
+        ),
+        (
+            ROM_COLD_BOOT_DOT_NO_RECOVERY_HANDLERS,
+            0x1_0026,
+            "No DOT locked-state recovery handlers configured"
+        ),
+        (
+            ROM_COLD_BOOT_DOT_FLASH_READ_FAILED,
+            0x1_0027,
+            "Failed to read DOT blob from flash"
+        ),
+        (ROM_I3C_SERVICES_TIMEOUT, 0x1_0028, "I3C services timed out"),
+        (
+            ROM_FW_HITLESS_UPDATE_CLEAR_MB_FAILED,
+            0x1_0029,
+            "Hitless update failed to clear the Caliptra mailbox (other error)"
+        ),
+        (
+            ROM_COLD_BOOT_ENCRYPTED_FW_DECRYPT_SIZE_ZERO,
+            0x1_002A,
+            "Encrypted firmware ciphertext size is zero"
+        ),
+        (
+            ROM_COLD_BOOT_ENCRYPTED_FW_DECRYPT_KEY_IMPORT_INTERNAL_FAILED,
+            0x1_002B,
+            "Failed to import AES key (internal error)"
+        ),
+        (
+            ROM_COLD_BOOT_ENCRYPTED_FW_DECRYPT_KEY_IMPORT_START_FAILED,
+            0x1_002C,
+            "Failed to start AES key import"
+        ),
+        (
+            ROM_COLD_BOOT_ENCRYPTED_FW_DECRYPT_KEY_IMPORT_FINISH_FAILED,
+            0x1_002D,
+            "Failed to finish AES key import"
+        ),
+        (
+            ROM_COLD_BOOT_ENCRYPTED_FW_DECRYPT_KEY_IMPORT_RESP_INVALID,
+            0x1_002E,
+            "AES key import response was invalid"
+        ),
+        (
+            ROM_COLD_BOOT_ENCRYPTED_FW_DECRYPT_DMA_RESP_INVALID,
+            0x1_002F,
+            "AES GCM decrypt DMA response was invalid"
+        ),
+        (
+            ROM_COLD_BOOT_GET_FW_SIZE_START_FAILED,
+            0x1_0030,
+            "Failed to start GET_MCU_FW_SIZE command"
+        ),
+        (
+            ROM_COLD_BOOT_GET_FW_SIZE_FINISH_FAILED,
+            0x1_0031,
+            "Failed to finish GET_MCU_FW_SIZE command"
+        ),
+        (
+            ROM_COLD_BOOT_GET_FW_SIZE_RESP_INVALID,
+            0x1_0032,
+            "GET_MCU_FW_SIZE response was invalid (too short)"
+        ),
+        (
+            ROM_COLD_BOOT_GET_FW_SIZE_RESP_MISSING_SHA384,
+            0x1_0033,
+            "GET_MCU_FW_SIZE response was missing SHA-384 digest"
+        ),
+        (
+            ROM_FW_MANIFEST_DOT_UNSUPPORTED_VERSION,
+            0x1_0034,
+            "Unsupported firmware manifest DOT version"
+        ),
+        (
+            ROM_FW_MANIFEST_DOT_TOO_MANY_COMMANDS,
+            0x1_0035,
+            "Firmware manifest DOT contains too many commands"
+        ),
+        (
+            ROM_FW_MANIFEST_DOT_COMMANDS_INVALID,
+            0x1_0036,
+            "Firmware manifest DOT commands slice is invalid"
+        ),
+        (
+            ROM_FW_MANIFEST_DOT_CONFLICTING_COMMANDS,
+            0x1_0037,
+            "Firmware manifest DOT contains conflicting commands"
+        ),
+        (
+            ROM_FW_MANIFEST_DOT_UNKNOWN_COMMAND,
+            0x1_0038,
+            "Unknown DOT command in firmware manifest"
+        ),
+        (
+            ROM_STABLE_OWNER_KEY_PERSONALIZATION_SEED_SIZE_MISMATCH,
+            0x1_0039,
+            "Stable owner key personalization seed size mismatch"
+        ),
+        (
+            ROM_STABLE_OWNER_KEY_PERSONALIZATION_SEED_READ_FAILED,
+            0x1_003A,
+            "Failed to read stable owner key personalization seed from OTP"
+        ),
+        (
+            ROM_COLD_BOOT_FIELD_ENTROPY_PROG_START_FAILED,
+            0x1_003B,
+            "Cold boot failed to start field entropy program (other error)"
+        ),
+        (
+            ROM_COLD_BOOT_FIELD_ENTROPY_PROG_FINISH_FAILED,
+            0x1_003C,
+            "Cold boot failed to finish field entropy program (other error)"
+        ),
+        (
+            ROM_COLD_BOOT_FIELD_ENTROPY_ZEROIZED,
+            0x1_0043,
+            "Field entropy slot is zeroized"
+        ),
+        (
+            ROM_COLD_BOOT_FIELD_ENTROPY_PARTIAL,
+            0x1_0044,
+            "Field entropy slot is partially programmed"
+        ),
+        (
+            ROM_COLD_BOOT_FIELD_ENTROPY_INVALID_PARTITION,
+            0x1_003F,
+            "Field entropy partition is invalid"
+        ),
+        (
+            ROM_COLD_BOOT_READ_FIELD_ENTROPY_STATE_ERROR,
+            0x1_0040,
+            "Failed to read FIELD_ENTROPY_STATE from OTP"
+        ),
+        (
+            ROM_COLD_BOOT_WRITE_FIELD_ENTROPY_STATE_STARTED_ERROR,
+            0x1_0041,
+            "Failed to write FIELD_ENTROPY_STATE (started) to OTP"
+        ),
+        (
+            ROM_COLD_BOOT_WRITE_FIELD_ENTROPY_STATE_FINISHED_ERROR,
+            0x1_0042,
+            "Failed to write FIELD_ENTROPY_STATE (finished) to OTP"
+        ),
+        (
+            ROM_SOC_PK_HASH_VERIFY_INTERNAL_ERROR,
+            0x5_001B,
+            "Production debug unlock PK hash verification internal error"
+        ),
+        (
+            ROM_SOC_PK_HASH_VERIFY_OTP_READ_FAILED,
+            0x5_001C,
+            "Production debug unlock PK hash verification OTP read failed"
+        ),
+        (
+            ROM_SOC_PK_HASH_VERIFY_LEN_MISMATCH,
+            0x5_001D,
+            "Production debug unlock PK hash verification length mismatch"
+        ),
+        (
+            ROM_COMPONENT_SVN_MANIFEST_ERROR,
+            0x5_001E,
+            "MCU Component SVN Manifest validation error"
+        ),
+        (
+            ROM_CALIPTRA_RUNTIME_SVN_BURN_ERROR,
+            0x1_0045,
+            "Caliptra runtime SVN fuse burn failed"
+        ),
+        (
+            GENERIC_EXCEPTION,
+            0xF_0000,
+            "Machine level exception was encountered during ROM execution"
+        ),
+    ];
+}
+
+impl From<core::num::NonZeroU32> for crate::McuError {
+    fn from(val: core::num::NonZeroU32) -> Self {
+        crate::McuError(val)
+    }
+}
+
+impl From<McuError> for core::num::NonZeroU32 {
+    fn from(val: McuError) -> Self {
+        val.0
+    }
+}
+
+impl From<McuError> for u32 {
+    fn from(val: McuError) -> Self {
+        core::num::NonZeroU32::from(val).get()
+    }
+}
+
+impl TryFrom<u32> for McuError {
+    type Error = TryFromIntError;
+    fn try_from(val: u32) -> Result<Self, TryFromIntError> {
+        match NonZeroU32::try_from(val) {
+            Ok(val) => Ok(McuError(val)),
+            Err(err) => Err(err),
+        }
+    }
+}
+
+pub type McuResult<T> = Result<T, McuError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn test_try_from() {
+        assert!(McuError::try_from(0).is_err());
+        assert_eq!(
+            Ok(McuError::ROM_COLD_BOOT_CALIPTRA_FATAL_ERROR_BEFORE_MB_READY),
+            McuError::try_from(0x1_0000)
+        );
+    }
+
+    #[test]
+    fn test_error_constants_uniqueness() {
+        let constants = McuError::all_constants();
+        let mut error_values = HashSet::new();
+        let mut duplicates = Vec::new();
+
+        for (name, value) in constants {
+            if !error_values.insert(value) {
+                duplicates.push((name, value));
+            }
+        }
+
+        assert!(
+            duplicates.is_empty(),
+            "Found duplicate error codes: {:?}",
+            duplicates
+        );
+    }
+}

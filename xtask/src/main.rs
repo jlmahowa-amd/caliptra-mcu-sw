@@ -1,0 +1,809 @@
+// Licensed under the Apache-2.0 license
+
+use caliptra_api_types::DeviceLifecycle;
+use caliptra_mcu_builder::{CaliptraBuildArgs, ImageCfg};
+use caliptra_mcu_firmware_bundler::args::Commands as BundleCommands;
+use clap::{Parser, Subcommand};
+use clap_num::maybe_hex;
+use std::path::PathBuf;
+
+mod auth_manifest;
+mod cargo_lock;
+mod clippy;
+mod corim;
+mod coverage;
+mod deps;
+mod docs;
+mod emulator_cbinding;
+mod format;
+#[cfg(feature = "fpga_realtime")]
+mod fpga;
+mod fuses;
+mod header;
+mod network;
+mod pldm_fw_pkg;
+mod precheckin;
+mod registers;
+mod rom;
+mod runtime;
+mod sizes;
+mod test;
+mod vertex_ai;
+
+#[cfg(feature = "fpga_realtime")]
+use fpga::Fpga;
+
+use auth_manifest::AuthManifestCommands;
+
+#[derive(Parser)]
+#[command(version, about, long_about = None)]
+struct Xtask {
+    #[command(subcommand)]
+    xtask: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Build and Run Runtime image
+    Runtime {
+        /// HW revision in semver format (e.g., "2.0.0")
+        #[arg(long, value_parser = semver::Version::parse, default_value = "2.0.0")]
+        hw_revision: semver::Version,
+
+        /// Run with tracing options
+        #[arg(short, long, default_value_t = false)]
+        trace: bool,
+
+        /// TCP port to listen on for communication I3C socket
+        #[arg(long)]
+        i3c_port: Option<u16>,
+
+        /// Features to build runtime with
+        #[arg(long)]
+        features: Vec<String>,
+
+        #[arg(long, default_value_t = false)]
+        no_stdin: bool,
+
+        #[arg(long)]
+        caliptra_rom: Option<PathBuf>,
+
+        #[arg(long)]
+        caliptra_firmware: Option<PathBuf>,
+
+        #[arg(
+            long,
+            value_parser = maybe_hex::<u32>,
+            default_value_t = DeviceLifecycle::Production as u32
+        )]
+        device_security_state: u32,
+
+        #[arg(long)]
+        soc_manifest: Option<PathBuf>,
+
+        #[arg(long)]
+        vendor_pk_hash: Option<String>,
+
+        /// Path to the PLDM Firmware package to be used in streaming boot
+        #[arg(long)]
+        streaming_boot: Option<PathBuf>,
+
+        /// List of SoC images with format: <path>,<load_addr>,<staging_addr>,<image_id>,<exec_bit>,<component_id>,<feature>
+        /// Example: --soc_image image1.bin,0x80000000,0x60000000,2,2,2,test-flash-based-boot
+        #[arg(long = "soc_image", value_name = "SOC_IMAGE", num_args = 1.., required = false)]
+        soc_images: Option<Vec<ImageCfg>>,
+
+        /// Path to the Flash image to be used in streaming boot
+        #[arg(long)]
+        flash_image: Option<PathBuf>,
+
+        #[arg(long, value_parser=maybe_hex::<u32>)]
+        dccm_offset: Option<u32>,
+
+        #[arg(long, value_parser=maybe_hex::<u32>)]
+        dccm_size: Option<u32>,
+    },
+    /// Build Runtime image
+    RuntimeBuild {
+        /// Features to build runtime with
+        #[arg(long)]
+        features: Vec<String>,
+
+        #[arg(long)]
+        output: Option<String>,
+
+        /// Platform to build for. Default: emulator
+        #[arg(long)]
+        platform: Option<String>,
+
+        /// Build bare metal runtime instead of TockOS runtime
+        #[arg(long, default_missing_value = "caliptra-mcu-bare-metal", num_args = 0..=1)]
+        bare_metal: Option<String>,
+
+        /// Cargo profile to build with.  Default: `devel` (1 MB SRAM, all
+        /// debug components present, `release` cargo feature OFF — suitable for
+        /// live debugging and dev-time iteration).  Use `--profile release`
+        /// for the constrained 512 KB SRAM layout that mirrors the real
+        /// device, with the `release` cargo feature auto-enabled (strips kernel
+        /// `debug!()`, romtime `println!()`, DebugWriter, Console,
+        /// LowLevelDebug, ProcessConsole).
+        #[arg(long, default_value = "devel")]
+        profile: String,
+    },
+    /// Build ROM
+    RomBuild {
+        /// Platform to build for. Default: emulator
+        #[arg(long)]
+        platform: Option<String>,
+
+        /// Features to build ROM with.
+        #[arg(long)]
+        features: Option<String>,
+    },
+    /// Build and Run ROM image
+    Rom {
+        /// Run with tracing options
+        #[arg(short, long, default_value_t = false)]
+        trace: bool,
+    },
+    /// Report binary `.text` sizes vs. ROM size budgets across all
+    /// ROM variants (per platform / feature combo).
+    Sizes {
+        /// Output CSV instead of a Unicode table.
+        #[arg(long, default_value_t = false)]
+        csv: bool,
+        /// Override the default ROM variant list. See `precheckin
+        /// --variants` for the syntax.
+        #[arg(long)]
+        variants: Option<String>,
+    },
+    /// Build emulator binary and package it in emulators.zip
+    EmulatorBuild {
+        #[arg(long)]
+        output: Option<String>,
+    },
+    /// Build Caliptra ROM, firmware bundle, MCU ROM, runtime, and SoC manifest and package them together
+    AllBuild {
+        #[arg(long)]
+        output: Option<String>,
+
+        /// Platform to build for. Default: emulator
+        #[arg(long)]
+        platform: Option<String>,
+
+        #[arg(long)]
+        rom_features: Option<String>,
+
+        /// Comma-separated list of feature-specific MCU ROMs to package for tests
+        #[arg(long)]
+        test_rom_features: Option<String>,
+
+        /// Comma-separated list of feature flags to build Network ROMs with
+        #[arg(long)]
+        network_rom_features: Option<String>,
+
+        #[arg(long)]
+        runtime_features: Option<String>,
+
+        #[arg(long, default_value_t = false)]
+        separate_runtimes: bool,
+
+        /// List of SoC images with format: <path>,<load_addr>,<staging_addr>,<image_id>,<exec_bit>,<component_id>,<feature>
+        /// Example: --soc_image image1.bin,0x80000000,0x60000000,2,2,2,test-flash-based-boot
+        #[arg(long = "soc_image", value_name = "SOC_IMAGE", num_args = 1.., required = false)]
+        soc_images: Option<Vec<ImageCfg>>,
+
+        // MCU configuration to include in the SoC manifest
+        // format: mcu,<load_addr>,<staging_addr>,<image_id>,<exec_bit>,<feature>
+        // Example: --mcu_cfg mcu,0x10000000,0x10000000,1,1,test-dma
+        #[arg(
+            long = "mcu_cfg",
+            value_name = "MCU_CFG",
+            num_args = 1..,
+            required = false
+        )]
+        mcu_cfgs: Option<Vec<ImageCfg>>,
+
+        /// Path to the PLDM manifest TOML file
+        #[arg(short, long, value_name = "MANIFEST", required = false)]
+        pldm_manifest: Option<String>,
+
+        /// Vendor string for firmware components (e.g. "ACME Corp")
+        #[arg(long, value_name = "VENDOR")]
+        vendor: Option<String>,
+
+        /// Device model string for firmware components (e.g. "DeviceX")
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+
+        /// Cargo profile to build with.  Default: `devel`.
+        #[arg(long, default_value = "devel")]
+        profile: String,
+    },
+    /// Generate CoRIM (Concise Reference Integrity Manifest) from build artifacts
+    Corim {
+        #[command(subcommand)]
+        subcommand: CorimCommands,
+    },
+    /// Commands related to flash images
+    FlashImage {
+        #[command(subcommand)]
+        subcommand: FlashImageCommands,
+    },
+    /// Run clippy on all targets
+    Clippy {
+        /// Override the default ROM variant list. See `precheckin
+        /// --variants` for the syntax.
+        #[arg(long)]
+        variants: Option<String>,
+    },
+    /// On-demand per-variant clippy pass against
+    /// `mcu-rom-{emulator,fpga}`.
+    ClippyRomVariants {
+        /// Override the default ROM variant list. See `precheckin
+        /// --variants` for the syntax.
+        #[arg(long)]
+        variants: Option<String>,
+    },
+    /// Build docs
+    Docs,
+    /// Check that all files are formatted
+    Format,
+    /// Run pre-check-in checks
+    Precheckin {
+        /// Override the default ROM variant list used by clippy,
+        /// build-all, etc. Format: comma-separated
+        /// `platform:features` items, where features uses `+` as the
+        /// inner separator (e.g.,
+        /// `emulator:hw-2-1+test-rom-hooks,fpga:hw-2-1`). Pass
+        /// `emulator:` for the default emulator build.
+        #[arg(long)]
+        variants: Option<String>,
+    },
+    /// Check cargo lock
+    CargoLock,
+    /// Run code coverage analysis
+    Coverage {
+        /// Only analyze existing coverage data (skip test run)
+        #[arg(long, default_value_t = false)]
+        analyze_only: bool,
+    },
+    /// Check files for Apache license header
+    HeaderCheck,
+    /// Add Apache license header to files where it is missing
+    HeaderFix,
+    /// Build each ROM variant and verify it doesn't panic.
+    PanicCheck {
+        /// Override the default ROM variant list. See `precheckin
+        /// --variants` for the syntax.
+        #[arg(long)]
+        variants: Option<String>,
+    },
+    /// Run tests (or from an archive)
+    Test {
+        /// File path to a pre-built test archive
+        #[arg(long)]
+        archive: Option<PathBuf>,
+
+        /// Run tests in a shard (e.g., "hash:1/4")
+        #[arg(long)]
+        shard: Option<String>,
+
+        /// Remap workspace path for archived tests
+        #[arg(long)]
+        workspace_remap: Option<PathBuf>,
+
+        /// Path to the firmware bundle ZIP
+        #[arg(long)]
+        firmware_bundle: Option<PathBuf>,
+
+        /// Path to the emulator bundle ZIP
+        #[arg(long)]
+        emulator_bundle: Option<PathBuf>,
+
+        /// A specific test filter to apply (e.g., "test(my_test)")
+        #[arg(long)]
+        test_filter: Option<String>,
+
+        /// Nextest profile to use (default: nightly-emulator)
+        #[arg(long)]
+        nextest_profile: Option<String>,
+    },
+    /// Check that the ROM builds do not contain any panic symbols
+    RomCheckPanic,
+    /// Archive tests to a file
+    TestArchive {
+        /// Archive tests to a file
+        #[arg(long)]
+        archive: String,
+    },
+    /// Autogenerate register files, fuse files and emulator bus from RDL
+    RegistersAutogen {
+        /// Check output only
+        #[arg(short, long, default_value_t = false)]
+        check: bool,
+
+        /// Extra RDL files to parse
+        #[arg(short, long)]
+        files: Vec<PathBuf>,
+
+        /// Extra addrmap entries to add
+        /// Must be in the format of "type@addr"
+        #[arg(short, long)]
+        addrmap: Vec<String>,
+
+        /// Path to fuses.hjson file. Default: hw/fuses.hjson
+        #[arg(long)]
+        fuses_hjson: Option<PathBuf>,
+
+        /// Path to otp_ctrl_mmap.hjson file. Default: hw/caliptra-ss/src/fuse_ctrl/data/otp_ctrl_mmap.hjson
+        #[arg(long)]
+        otp_mmap_hjson: Option<PathBuf>,
+    },
+    /// Check dependencies
+    Deps,
+    /// Manage FPGA Life cycle
+    #[cfg(feature = "fpga_realtime")]
+    Fpga {
+        #[command(subcommand)]
+        subcommand: Fpga,
+    },
+    // TODO(clundin): Refactor into FPGA module.
+    /// Run firmware on the FPGA
+    #[cfg(feature = "fpga_realtime")]
+    FpgaRun {
+        /// ZIP with all images.
+        #[arg(long)]
+        zip: Option<PathBuf>,
+
+        /// Where to load the MCU ROM from.
+        #[arg(long)]
+        mcu_rom: Option<PathBuf>,
+
+        /// Where to load the Caliptra ROM from.
+        #[arg(long)]
+        caliptra_rom: Option<PathBuf>,
+
+        /// Where to load and save OTP memory.
+        #[arg(long)]
+        otp: Option<PathBuf>,
+
+        /// Save OTP memory to a file after running.
+        #[arg(long, default_value_t = false)]
+        save_otp: bool,
+
+        /// Run UDS provisioning flow
+        #[arg(long, default_value_t = false)]
+        uds: bool,
+
+        /// Number of "steps" to run the FPGA before stopping
+        #[arg(long, default_value_t = 1_000_000)]
+        steps: u64,
+
+        /// Whether to disable the recovery interface and I3C
+        #[arg(long, default_value_t = false)]
+        no_recovery: bool,
+
+        /// Lifecycle controller state to set (raw, test_unlocked0, manufacturing, prod, etc.).
+        #[arg(long)]
+        lifecycle: Option<String>,
+    },
+    /// Utility to create and parse PLDM firmware packages
+    PldmFirmware {
+        #[command(subcommand)]
+        subcommand: PldmFirmwareCommands,
+    },
+    /// Emulator C binding utilities
+    EmulatorCbinding {
+        #[command(subcommand)]
+        subcommand: EmulatorCbindingCommands,
+    },
+    /// Auth Manifest generation and parsing
+    AuthManifest {
+        #[command(subcommand)]
+        subcommand: AuthManifestCommands,
+    },
+    /// Commands related to firmware bundling.
+    FirmwareBundler {
+        #[command(subcommand)]
+        cmd: BundleCommands,
+    },
+    /// Network stack development tools (TAP, DHCP/TFTP server, lwip-rs)
+    Network {
+        #[command(subcommand)]
+        cmd: network::NetworkCommands,
+    },
+    /// Call Vertex AI Gemini API
+    VertexPrompt {
+        /// The prompt to send to the model
+        prompt: String,
+
+        /// Model to use
+        #[arg(long, default_value = "gemini-2.5-flash")]
+        model: String,
+
+        /// GCP Project ID. If not specified, will try to detect.
+        #[arg(long)]
+        project: Option<String>,
+
+        /// GCP Location
+        #[arg(long, default_value = "us-central1")]
+        location: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum FlashImageCommands {
+    /// Create a new flash image
+    Create {
+        /// Path to the Caliptra firmware file
+        #[arg(long, value_name = "CALIPTRA_FW", required = true)]
+        caliptra_fw: Option<String>,
+
+        /// Path to the SoC manifest file
+        #[arg(long, value_name = "SOC_MANIFEST", required = true)]
+        soc_manifest: Option<String>,
+
+        /// Path to the MCU runtime file
+        #[arg(long, value_name = "MCU_RUNTIME", required = true)]
+        mcu_runtime: Option<String>,
+
+        /// List of SoC images
+        /// Example: --soc-images /tmp/a.bin --soc-images /tmp/b.bin
+        #[arg(long, value_name = "SOC_IMAGE", num_args=1.., required = false)]
+        soc_images: Option<Vec<String>>,
+
+        /// Paths to the output image file
+        #[arg(long, value_name = "OUTPUT", required = true)]
+        output: String,
+    },
+    /// Verify an existing flash image
+    Verify {
+        /// Path to the flash image file
+        #[arg(value_name = "FILE")]
+        file: String,
+
+        /// Offset of the flash image in the file
+        #[arg(long, value_name = "OFFSET", default_value_t = 0)]
+        offset: u32,
+    },
+}
+
+#[derive(Subcommand)]
+enum PldmFirmwareCommands {
+    /// Encode a manifest TOML file to a firmware package
+    Create {
+        /// Path to the manifest TOML file
+        #[arg(short, long, value_name = "MANIFEST", required = true)]
+        manifest: String,
+
+        /// Output file for the firmware package
+        #[arg(short, long, value_name = "FILE", required = true)]
+        file: String,
+    },
+    /// Decode a firmware package to a manifest and components
+    Decode {
+        /// Path to the firmware package file
+        #[arg(short, long, value_name = "PACKAGE", required = true)]
+        package: String,
+
+        /// Output directory for manifest and components
+        #[arg(short, long, value_name = "DIRECTORY", required = true)]
+        dir: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum EmulatorCbindingCommands {
+    /// Build all emulator C binding components (library, header, and binary)
+    Build {
+        /// Build in release mode (optimized)
+        #[arg(long, default_value_t = false)]
+        release: bool,
+    },
+    /// Build only the Rust static library and generate C header
+    BuildLib {
+        /// Build in release mode (optimized)
+        #[arg(long, default_value_t = false)]
+        release: bool,
+    },
+    /// Build only the C emulator binary
+    BuildEmulator {
+        /// Build in release mode (optimized)
+        #[arg(long, default_value_t = false)]
+        release: bool,
+    },
+    /// Clean all build artifacts
+    Clean {
+        /// Clean release mode artifacts (otherwise cleans debug artifacts)
+        #[arg(long, default_value_t = false)]
+        release: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum CorimCommands {
+    /// Generate a reference-value CoRIM from a firmware bundle
+    #[command(long_about = "\
+Generate a reference-value CoRIM from a firmware bundle.
+
+Reads the all-build ZIP bundle (from `cargo xtask all-build`) and produces
+CoMID/CoRIM CBOR files with reference value digests for each firmware component.
+
+Components are auto-discovered from the bundle:
+  mkey 0: FMC_INFO      - Caliptra FMC (from caliptra_fw.bin)
+  mkey 1: RT_INFO        - Caliptra Runtime (from caliptra_fw.bin)
+  mkey 2: SOC_MANIFEST   - Authorization Manifest (soc_manifest.bin)
+  mkey 3+: SoC firmware  - Auto-discovered from AuthManifest metadata
+
+CONFIG FILE (--config):
+  Optional JSON file controlling vendor/model, hash algorithm, output
+  directory, and signing. Run `cargo xtask corim sample-config` to see
+  a fully annotated sample. All fields are optional with defaults:
+
+    vendor      \"ChipsAlliance\"    Vendor string for SoC components
+    model       \"Caliptra-SS\"      Model string for SoC components
+    hash_algo   \"sha-384\"          Digest algorithm (sha-256 or sha-384)
+    output_dir  \"target/corim\"     Output directory
+    signing     (default test key)  Always signs; uses deterministic P-384 test key by default
+
+  Signing modes (mutually exclusive):
+    test_key    Seed string for deterministic P-384 test key generation (default if omitted)
+    key + cert  Paths to external JWK (RFC 7517) key and DER certificate
+
+EXAMPLES:
+  # Signed with default test key, all defaults:
+  cargo xtask corim gen-refval --bundle target/all-fw.zip
+
+  # With custom config (signing, vendor, etc.):
+  cargo xtask corim gen-refval --bundle target/all-fw.zip --config config.json")]
+    GenRefval {
+        /// Path to the firmware bundle ZIP (from `cargo xtask all-build`)
+        #[arg(long, value_name = "BUNDLE", required = true)]
+        bundle: String,
+
+        /// Path to JSON config file (vendor, model, hash_algo, signing, etc.)
+        #[arg(long, value_name = "CONFIG")]
+        config: Option<String>,
+
+        /// Feature name to select per-feature entries from the bundle
+        /// (e.g. "test-mctp-spdm-attestation").
+        /// When set, reads mcu-test-runtime-<feature>.bin and
+        /// mcu-test-soc-manifest-<feature>.bin instead of the generic entries.
+        #[arg(long, value_name = "FEATURE")]
+        feature: Option<String>,
+    },
+    /// Print a sample JSON config file with all fields documented
+    SampleConfig,
+}
+
+/// Resolve a `--variants` CLI value to a `Vec<RomVariant>`. `None`
+/// returns the project-wide default list
+/// (`caliptra_mcu_builder::features::ROM_VARIANTS`).
+fn resolve_variants(
+    raw: Option<&str>,
+) -> Result<Vec<caliptra_mcu_builder::features::RomVariant>, anyhow::Error> {
+    use caliptra_mcu_builder::features::{parse_variants, ROM_VARIANTS};
+    match raw {
+        Some(s) => parse_variants(s).map_err(|e| anyhow::anyhow!("invalid --variants: {e}")),
+        None => Ok(ROM_VARIANTS.to_vec()),
+    }
+}
+
+fn main() {
+    let cli = Xtask::parse();
+    let result = match &cli.xtask {
+        Commands::AllBuild {
+            output,
+            platform,
+            rom_features,
+            test_rom_features: _,
+            network_rom_features: _,
+            runtime_features,
+            separate_runtimes,
+            soc_images,
+            mcu_cfgs,
+            pldm_manifest,
+            vendor,
+            model,
+            profile,
+        } => caliptra_mcu_builder::all_build(caliptra_mcu_builder::AllBuildArgs {
+            output: output.as_deref(),
+            platform: platform.as_deref(),
+            rom_features: rom_features.as_deref(),
+            runtime_features: runtime_features.as_deref(),
+            separate_runtimes: *separate_runtimes,
+            soc_images: soc_images.clone(),
+            mcu_cfgs: mcu_cfgs.clone(),
+            pldm_manifest: pldm_manifest.as_deref(),
+            vendor: vendor.as_deref(),
+            model: model.as_deref(),
+            profile: Some(profile.as_str()),
+        }),
+        Commands::EmulatorBuild { output } => {
+            caliptra_mcu_builder::emulator_build(caliptra_mcu_builder::EmulatorBuildArgs {
+                output: output.as_deref(),
+            })
+        }
+        Commands::Runtime { .. } => runtime::runtime_run(cli.xtask),
+        Commands::RuntimeBuild {
+            features,
+            output,
+            platform,
+            bare_metal,
+            profile,
+        } => {
+            if let Some(bare_metal_pkg) = bare_metal {
+                caliptra_mcu_builder::bare_metal_build(platform.as_deref(), bare_metal_pkg)
+                    .map(|_| ())
+            } else {
+                // The opt-in `release` cargo profile auto-enables the `release` cargo
+                // feature, which strips the kernel `debug!()` macro, romtime
+                // `println!`, DebugWriter, Console, LowLevelDebug, and
+                // ProcessConsole.  The bundler also uses the default 512 KB SRAM
+                // platform manifest.  The default `devel` profile keeps all of
+                // those for live-debugging-friendly builds with the 1 MB SRAM
+                // layout.
+                let mut features: Vec<&str> = features.iter().map(|x| x.as_str()).collect();
+                if profile == "release" && !features.contains(&"release") {
+                    features.push("release");
+                }
+                let features_str = features.join(",");
+                caliptra_mcu_builder::runtime_build_with_apps(
+                    &caliptra_mcu_builder::CaliptraBuildArgs {
+                        features: Some(&features_str),
+                        output_name: output.clone(),
+                        platform: platform.as_deref(),
+                        profile: Some(profile.as_str()),
+                        ..Default::default()
+                    },
+                )
+                .map(|_| ())
+            }
+        }
+        Commands::Rom { trace } => rom::rom_run(*trace),
+        Commands::RomBuild { platform, features } => {
+            caliptra_mcu_builder::rom_build(&CaliptraBuildArgs {
+                platform: platform.as_deref(),
+                features: features.as_deref(),
+                ..Default::default()
+            })
+            .map(|_| ())
+        }
+        Commands::Sizes { csv, variants } => {
+            resolve_variants(variants.as_deref()).and_then(|resolved| {
+                sizes::run(
+                    if *csv {
+                        sizes::Format::Csv
+                    } else {
+                        sizes::Format::Table
+                    },
+                    &resolved,
+                )
+            })
+        }
+        Commands::FlashImage { subcommand } => match subcommand {
+            FlashImageCommands::Create {
+                caliptra_fw,
+                soc_manifest,
+                mcu_runtime,
+                soc_images,
+                output,
+            } => caliptra_mcu_builder::flash_image::flash_image_create_inner(
+                caliptra_fw,
+                soc_manifest,
+                mcu_runtime,
+                soc_images,
+                0,
+                output,
+            ),
+            FlashImageCommands::Verify { file, offset } => {
+                caliptra_mcu_builder::flash_image::flash_image_verify(file, *offset)
+            }
+        },
+        Commands::Clippy { variants } => {
+            resolve_variants(variants.as_deref()).and_then(|v| clippy::clippy(&v))
+        }
+        Commands::ClippyRomVariants { variants } => {
+            resolve_variants(variants.as_deref()).and_then(|v| clippy::rom_variants(&v))
+        }
+        Commands::Docs => docs::docs(),
+        Commands::Precheckin { variants } => {
+            resolve_variants(variants.as_deref()).and_then(|v| precheckin::precheckin(&v))
+        }
+        Commands::Format => format::format(),
+        Commands::CargoLock => cargo_lock::cargo_lock(),
+        Commands::Coverage { analyze_only } => coverage::coverage(*analyze_only),
+        Commands::HeaderFix => header::fix(),
+        Commands::HeaderCheck => header::check(),
+        Commands::PanicCheck { variants } => {
+            resolve_variants(variants.as_deref()).and_then(|v| test::test_panic_missing(&v))
+        }
+        Commands::Test {
+            archive,
+            shard,
+            workspace_remap,
+            firmware_bundle,
+            emulator_bundle,
+            test_filter,
+            nextest_profile,
+        } => test::test(test::TestArgs {
+            archive: archive.as_deref().and_then(|p| p.to_str()),
+            shard: shard.as_deref(),
+            workspace_remap: workspace_remap.as_deref().and_then(|p| p.to_str()),
+            firmware_bundle: firmware_bundle.as_deref().and_then(|p| p.to_str()),
+            emulator_bundle: emulator_bundle.as_deref().and_then(|p| p.to_str()),
+            test_filter: test_filter.as_deref(),
+            nextest_profile: nextest_profile.as_deref(),
+        }),
+        Commands::RomCheckPanic => {
+            resolve_variants(None).and_then(|v| test::test_panic_missing(&v))
+        }
+        Commands::TestArchive { archive } => test::test_archive(archive.clone()),
+        Commands::RegistersAutogen {
+            check,
+            files,
+            addrmap,
+            fuses_hjson,
+            otp_mmap_hjson,
+        } => registers::autogen(
+            *check,
+            files,
+            addrmap,
+            fuses_hjson.as_deref(),
+            otp_mmap_hjson.as_deref(),
+        ),
+        Commands::Deps => deps::check(),
+        #[cfg(feature = "fpga_realtime")]
+        Commands::Fpga { subcommand } => fpga::fpga_entry(subcommand),
+        // TODO(clundin): Refactor into FPGA module.
+        #[cfg(feature = "fpga_realtime")]
+        Commands::FpgaRun { .. } => fpga::fpga_run(cli.xtask),
+        Commands::PldmFirmware { subcommand } => match subcommand {
+            PldmFirmwareCommands::Create { manifest, file } => pldm_fw_pkg::create(manifest, file),
+            PldmFirmwareCommands::Decode { package, dir } => pldm_fw_pkg::decode(package, dir),
+        },
+        Commands::EmulatorCbinding { subcommand } => match subcommand {
+            EmulatorCbindingCommands::Build { release } => emulator_cbinding::build_all(*release),
+            EmulatorCbindingCommands::BuildLib { release } => {
+                emulator_cbinding::build_lib(*release)
+            }
+            EmulatorCbindingCommands::BuildEmulator { release } => {
+                emulator_cbinding::build_emulator(*release)
+            }
+            EmulatorCbindingCommands::Clean { release } => emulator_cbinding::clean(*release),
+        },
+        Commands::AuthManifest { subcommand } => match subcommand {
+            AuthManifestCommands::Create {
+                images,
+                mcu_image,
+                output,
+            } => auth_manifest::create(images, mcu_image, output),
+            AuthManifestCommands::Parse { file } => auth_manifest::parse(file),
+        },
+        Commands::Corim { subcommand } => match subcommand {
+            CorimCommands::GenRefval {
+                bundle,
+                config,
+                feature,
+            } => corim::CorimConfig::load(config.as_deref())
+                .and_then(|cfg| corim::generate(bundle, cfg, feature.as_deref())),
+            CorimCommands::SampleConfig => {
+                corim::CorimConfig::print_sample();
+                Ok(())
+            }
+        },
+        Commands::FirmwareBundler { cmd } => caliptra_mcu_firmware_bundler::execute(cmd.clone()),
+        Commands::Network { cmd } => network::run(cmd.clone()),
+        Commands::VertexPrompt {
+            prompt,
+            model,
+            project,
+            location,
+        } => vertex_ai::prompt(prompt, model, project.clone(), location),
+    };
+    result.unwrap_or_else(|e| {
+        eprintln!("Error: {:?}", e);
+        std::process::exit(1);
+    });
+}

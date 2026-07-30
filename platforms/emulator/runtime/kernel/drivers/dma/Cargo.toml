@@ -1,0 +1,18 @@
+# Licensed under the Apache-2.0 license.
+
+[package]
+name = "caliptra-mcu-dma-driver"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[dependencies]
+kernel.workspace = true
+
+# [target.'cfg(target_arch = "riscv32")'.dependencies]
+capsules-core.workspace = true
+caliptra-mcu-capsules-runtime.workspace = true
+caliptra-mcu-registers-generated.workspace = true
+caliptra-mcu-romtime.workspace = true
+tock-registers.workspace = true
+

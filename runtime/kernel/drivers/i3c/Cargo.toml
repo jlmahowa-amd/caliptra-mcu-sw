@@ -1,0 +1,15 @@
+# Licensed under the Apache-2.0 license
+
+[package]
+name = "caliptra-mcu-i3c-driver"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[dependencies]
+capsules-core.workspace = true
+kernel.workspace = true
+caliptra-mcu-registers-generated.workspace = true
+caliptra-mcu-romtime.workspace = true
+rv32i.workspace = true
+tock-registers.workspace = true

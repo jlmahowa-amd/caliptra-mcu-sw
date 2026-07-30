@@ -1,0 +1,7 @@
+---
+seed: 1
+testname: mcu_lmem_exe
+pre-exec: |
+  set -eu
+  echo "Running pre_exec for [mcu_lmem_exe]"
+  make -f $CALIPTRA_SS_ROOT/tools/scripts/Makefile TESTNAME=mcu_lmem_exe CALIPTRA_TESTNAME=cptra_bringup mcu_program.hex cptra_program.hex

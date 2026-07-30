@@ -1,0 +1,13 @@
+# Licensed under the Apache-2.0 license
+
+[package]
+name = "caliptra-mcu-emulator-registers-generated"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+caliptra-emu-bus.workspace = true
+caliptra-emu-types.workspace = true
+caliptra-mcu-registers-generated.workspace = true
+tock-registers.workspace = true

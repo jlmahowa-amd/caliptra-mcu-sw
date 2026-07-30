@@ -1,0 +1,21 @@
+# Licensed under the Apache-2.0 license
+
+[package]
+name = "caliptra-mcu-testing-common"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+caliptra-api-types.workspace = true
+bitfield.workspace = true
+crc.workspace = true
+caliptra-mcu-mctp-vdm-common.workspace = true
+caliptra-mcu-pldm-common.workspace = true
+caliptra-mcu-pldm-ua.workspace = true
+caliptra-mcu-emulator-state.workspace = true
+zerocopy.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+rand.workspace = true

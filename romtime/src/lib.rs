@@ -1,0 +1,205 @@
+// Licensed under the Apache-2.0 license
+
+#![cfg_attr(target_arch = "riscv32", no_std)]
+#![allow(static_mut_refs)]
+
+mod component_svn_manifest;
+pub use component_svn_manifest::*;
+mod fuse_layout;
+pub use fuse_layout::*;
+pub mod handoff;
+mod lifecycle;
+pub use lifecycle::*;
+mod boot_status;
+pub use boot_status::*;
+mod mci;
+pub use mci::*;
+#[cfg(feature = "ocp-lock")]
+pub mod ocp_lock;
+pub mod otp;
+pub use otp::*;
+mod soc_manager;
+pub use soc_manager::*;
+mod static_ref;
+pub use static_ref::*;
+mod otp_provision;
+pub use otp_provision::*;
+mod mci_mbox_cmd;
+pub use mci_mbox_cmd::*;
+
+// Helpers to handle writing to the emulator UART output.
+
+use core::fmt::{Display, Write};
+
+pub static mut WRITER: Option<&'static mut dyn Write> = None;
+pub static mut EXITER: Option<&'static mut dyn Exit> = None;
+
+/// Sets the global backing writer for `print` and `println` macros.
+pub fn set_printer(writer: &'static mut dyn Write) {
+    unsafe {
+        WRITER = Some(writer);
+    }
+}
+
+#[cfg(not(feature = "no-print"))]
+#[macro_export]
+macro_rules! print {
+    ($($arg:tt)*) => {
+        unsafe {
+            if let Some(writer) = $crate::WRITER.as_mut() {
+                use ::core::fmt::Write as _;
+                let _ = write!(writer, $($arg)*);
+            }
+        }
+    };
+}
+
+#[cfg(feature = "no-print")]
+#[macro_export]
+macro_rules! print {
+    ($($arg:tt)*) => {{
+        // Type-check `format_args!` (so all call sites stay valid) but discard
+        // the resulting `Arguments` so LTO/lld can drop it along with any
+        // `Display`/`Debug` impls reached through it.  Same pattern as Tock's
+        // `no_debug_panics` feature on the `debug!` macro.
+        let _ = ::core::format_args!($($arg)*);
+    }};
+}
+
+#[cfg(not(feature = "no-print"))]
+#[macro_export]
+macro_rules! println {
+    ($($arg:tt)*) => {
+        if let Some(writer) = unsafe { $crate::WRITER.as_mut() } {
+            use ::core::fmt::Write as _;
+            let _ = writeln!(writer, $($arg)*);
+        }
+    };
+}
+
+#[cfg(feature = "no-print")]
+#[macro_export]
+macro_rules! println {
+    ($($arg:tt)*) => {{
+        let _ = ::core::format_args!($($arg)*);
+    }};
+}
+
+pub struct HexBytes<'a>(pub &'a [u8]);
+impl Display for HexBytes<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Rust can't prove the indexes are correct in a format macro.
+        for &x in self.0.iter() {
+            let c = x >> 4;
+            if c < 10 {
+                f.write_char((c + b'0') as char)?;
+            } else {
+                f.write_char((c - 10 + b'A') as char)?;
+            }
+            let c = x & 0xf;
+            if c < 10 {
+                f.write_char((c + b'0') as char)?;
+            } else {
+                f.write_char((c - 10 + b'A') as char)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+pub struct HexWord(pub u32);
+impl Display for HexWord {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        HexBytes(&self.0.to_be_bytes()).fmt(f)
+    }
+}
+
+pub trait Exit {
+    fn exit(&mut self, code: u32);
+}
+
+pub fn set_exiter(exiter: &'static mut dyn Exit) {
+    unsafe {
+        EXITER = Some(exiter);
+    }
+}
+
+pub fn test_exit(code: u32) -> ! {
+    unsafe {
+        if let Some(exiter) = EXITER.as_mut() {
+            exiter.exit(code);
+        }
+    }
+    #[allow(clippy::empty_loop)]
+    loop {}
+}
+
+#[cfg(not(target_arch = "riscv32"))]
+pub fn crc8(crc: u8, data: u8) -> u8 {
+    // CRC-8 with last 8 bits of polynomial x^8 + x^2 + x^1 + 1.
+    let polynomial = 0x07;
+    let mut crc = crc;
+    crc ^= data;
+    for _ in 0..8 {
+        if crc & 0x80 != 0 {
+            crc = (crc << 1) ^ polynomial;
+        } else {
+            crc <<= 1;
+        }
+    }
+    crc
+}
+
+#[cfg(target_arch = "riscv32")]
+pub fn crc8(crc: u8, data: u8) -> u8 {
+    // CRC-8 with last 8 bits of polynomial x^8 + x^2 + x^1 + 1.
+    let polynomial = 0x07;
+    let crc = (crc ^ data) as usize;
+    let a: usize;
+    let b: usize;
+
+    unsafe {
+        core::arch::asm!(
+            "clmul {a}, {crc}, {poly}",
+            "srli {tmp}, {a}, 8",
+            "clmul {b}, {tmp}, {poly}",
+            crc = in(reg) crc,
+            poly = in(reg) polynomial,
+            a = out(reg) a,
+            b = out(reg) b,
+            tmp = out(reg) _,
+        );
+    }
+
+    (a ^ b) as u8
+}
+
+#[cfg(not(target_arch = "riscv32"))]
+/// Returns ths current cycle count using the RISC-V mcycle CSRs.
+pub fn mcycle() -> u64 {
+    // placeholder value for non-RV32
+    0
+}
+
+#[cfg(target_arch = "riscv32")]
+/// Returns ths current cycle count using the RISC-V mcycle CSRs.
+pub fn mcycle() -> u64 {
+    use tock_registers::interfaces::Readable;
+    use tock_registers::register_bitfields;
+    register_bitfields![usize,
+        value [
+            value OFFSET(0) NUMBITS(32) [],
+        ],
+    ];
+    let mcycle: riscv_csr::csr::ReadWriteRiscvCsr<
+        usize,
+        value::Register,
+        { riscv_csr::csr::MCYCLE },
+    > = riscv_csr::csr::ReadWriteRiscvCsr::new();
+    let mcycleh: riscv_csr::csr::ReadWriteRiscvCsr<
+        usize,
+        value::Register,
+        { riscv_csr::csr::MCYCLEH },
+    > = riscv_csr::csr::ReadWriteRiscvCsr::new();
+    ((mcycleh.get() as u64) << 32) | (mcycle.get() as u64)
+}

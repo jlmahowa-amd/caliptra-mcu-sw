@@ -1,0 +1,24 @@
+# Licensed under the Apache-2.0 license
+
+[package]
+name = "caliptra-mcu-emulator-cbinding"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "caliptra_mcu_emulator_cbinding"
+crate-type = ["staticlib"]
+
+[dependencies]
+caliptra-mcu-emulator.workspace = true
+libc.workspace = true
+caliptra-emu-bus.workspace = true
+caliptra-emu-cpu.workspace = true
+caliptra-emu-types.workspace = true
+caliptra-image-types = { workspace = true, features = ["std"] }
+caliptra-api-types.workspace = true
+caliptra-mcu-testing-common.workspace = true
+semver.workspace = true
+
+[build-dependencies]
+cbindgen.workspace = true

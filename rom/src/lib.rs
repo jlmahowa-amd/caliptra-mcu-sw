@@ -1,0 +1,177 @@
+/*++
+
+Licensed under the Apache-2.0 license.
+
+File Name:
+
+    lib.rs
+
+Abstract:
+
+    Common libraries for MCU ROM.
+
+--*/
+
+#![no_std]
+
+#[cfg(all(feature = "ocp-lock", feature = "stable-owner-key"))]
+compile_error!("features `ocp-lock` and `stable-owner-key` are mutually exclusive");
+
+// SVN header types now live in `caliptra-mcu-romtime`; re-export them
+// here so existing `caliptra_mcu_rom_common::McuComponentSvn*` paths
+// keep working.
+pub use caliptra_mcu_romtime::{
+    McuComponentSvnEntry, McuComponentSvnManifest, SvnFuseMapEntry, SvnLimits, SvnManifestError,
+    MCU_COMPONENT_SVN_MANIFEST_ENTRY_COUNT, MCU_COMPONENT_SVN_MANIFEST_MAGIC,
+    MCU_COMPONENT_SVN_MANIFEST_SIZE, MCU_COMPONENT_SVN_MANIFEST_VERSION,
+};
+mod device_ownership_transfer;
+pub use device_ownership_transfer::*;
+mod dot_override;
+pub use dot_override::*;
+pub mod flash;
+pub use flash::*;
+mod fuse_layout;
+pub use fuse_layout::*;
+mod fuses;
+pub use fuses::*;
+mod hooks;
+pub use hooks::*;
+pub mod image_verifier;
+pub use image_verifier::ImageVerifier;
+mod rom;
+pub use rom::*;
+mod rom_env;
+pub use rom_env::*;
+mod i3c;
+pub use i3c::{I3cConfig, I3cTimings};
+mod i3c_mailbox;
+pub use i3c_mailbox::{DotContext, I3cMailboxHandler};
+mod mailbox;
+pub mod recovery;
+#[cfg(feature = "stable-owner-key")]
+mod stable_owner_key;
+
+// Boot flow modules
+#[cfg(feature = "svn-manifest")]
+mod caliptra_svn;
+mod cold_boot;
+mod firmware_headers;
+mod fw_boot;
+mod warm_boot;
+pub use cold_boot::ColdBoot;
+pub use cold_boot::I3cDotLockedRecoveryHandler;
+pub use fw_boot::FwBoot;
+pub use warm_boot::WarmBoot;
+
+mod fw_hitless_update;
+pub use fw_hitless_update::FwHitlessUpdate;
+
+use caliptra_api::CaliptraApiError;
+
+#[cfg(feature = "ocp-lock")]
+pub use caliptra_mcu_romtime::ocp_lock;
+
+pub trait FatalErrorHandler {
+    fn fatal_error(&mut self, code: u32) -> !;
+}
+
+static mut FATAL_ERROR_HANDLER: Option<&'static mut dyn FatalErrorHandler> = None;
+
+/// Set the fatal error handler.
+///
+/// SAFETY: it is important that the passed fatal handler is never used otherwise
+/// and no other references exist to it. It is recommended to create a single instance
+/// of the struct and pass it in immediatly, and never use it otherwise.
+pub fn set_fatal_error_handler(handler: &'static mut dyn FatalErrorHandler) {
+    unsafe {
+        FATAL_ERROR_HANDLER = Some(handler);
+    }
+}
+
+/// A handler which outputs useful debug information if an exception is encountered during ROM
+/// execution.  The vendor is responsible for configuring the `mtvec` register during their start
+/// sequence to invoke a wrapper for this function which utilizes a discrete stack, and populates
+/// the mscratch register with the previously extant `sp`.  They are also responsible for ensuring
+/// the `mcause`, `mepc` and `ra` csrs/registers are not overwritten between the trap occurring and
+/// execution of this function.
+#[no_mangle]
+#[cfg(target_arch = "riscv32")]
+pub extern "C" fn exception_handler() -> ! {
+    let mut mcause: usize;
+    let mut mepc: usize;
+    let mut sp: usize;
+    let mut ra: usize;
+    unsafe {
+        core::arch::asm!(
+            "csrr {mcause}, mcause",
+            "csrr {mepc}, mepc",
+            "csrr {sp}, mscratch",
+            "addi {ra}, ra, 0",
+            mcause = out(reg) mcause,
+            mepc = out(reg) mepc,
+            sp = out(reg) sp,
+            ra = out(reg) ra
+        )
+    };
+
+    caliptra_mcu_romtime::println!(
+        "EXCEPTION mcause={mcause:#08X} mepc={mepc:#08X} sp={sp:#08X} ra={ra:#08X}"
+    );
+    fatal_error(caliptra_mcu_error::McuError::GENERIC_EXCEPTION)
+}
+
+#[no_mangle]
+#[inline(never)]
+#[cfg(target_arch = "riscv32")]
+fn panic_is_possible() {
+    core::hint::black_box(());
+    // The existence of this symbol is used to inform test_panic_missing
+    // that panics are possible. Do not remove or rename this symbol.
+}
+
+#[panic_handler]
+#[inline(never)]
+#[cfg(target_arch = "riscv32")]
+fn rom_panic(_: &core::panic::PanicInfo) -> ! {
+    panic_is_possible();
+    fatal_error_raw(0);
+}
+
+#[inline(never)]
+#[allow(dead_code)]
+#[allow(clippy::empty_loop)]
+fn fatal_error_raw(code: u32) -> ! {
+    #[allow(static_mut_refs)]
+    if let Some(handler) = unsafe { FATAL_ERROR_HANDLER.as_mut() } {
+        handler.fatal_error(code);
+    } else {
+        // If no handler is set, just set the MCI fatal error code and loop forever
+        RomEnv::new().mci.set_fw_fatal_error(code);
+        loop {}
+    }
+}
+
+#[inline(never)]
+#[allow(dead_code)]
+pub fn fatal_error(error: caliptra_mcu_error::McuError) -> ! {
+    fatal_error_raw(error.into())
+}
+
+/// Extract a u32 error code from a CaliptraApiError for logging.
+pub fn err_code(err: &CaliptraApiError) -> u32 {
+    match err {
+        CaliptraApiError::MailboxCmdFailed(c) => *c,
+        _ => 0xdead_ffff,
+    }
+}
+
+#[no_mangle]
+#[used]
+static mut CFI_STATE_ORG: [u32; 6] = [0; 6];
+
+#[no_mangle]
+extern "C" fn cfi_panic_handler(code: u32) -> ! {
+    caliptra_mcu_romtime::println!("[mcu-rom] CFI Panic");
+    fatal_error_raw(code | Into::<u32>::into(caliptra_mcu_error::McuError::ROM_CFI_PANIC));
+}

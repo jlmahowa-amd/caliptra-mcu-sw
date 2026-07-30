@@ -1,0 +1,1223 @@
+// Licensed under the Apache-2.0 license
+
+use anyhow::{anyhow, bail, Result};
+pub use api::mailbox::mbox_write_fifo;
+pub use api_types::{DbgManufServiceRegReq, DeviceLifecycle, Fuses, U4};
+use caliptra_api::mailbox::MailboxReqHeader;
+use caliptra_api::{self as api, SocManager};
+use caliptra_api_types as api_types;
+use caliptra_emu_bus::Event;
+pub use caliptra_emu_cpu::{CodeRange, ImageInfo, StackInfo, StackRange};
+use caliptra_hw_model::{ExitStatus, ModelCallback, ModelError, Output};
+use caliptra_hw_model_types::{
+    EtrngResponse, HexBytes, HexSlice, RandomEtrngResponses, RandomNibbles, DEFAULT_CPTRA_OBF_KEY,
+};
+use caliptra_image_types::FwVerificationPqcKeyType;
+use caliptra_mcu_mbox_common::messages::calc_checksum;
+use caliptra_mcu_romtime::McuBootMilestones;
+pub use caliptra_mcu_romtime::{LifecycleControllerState, LifecycleRawTokens, LifecycleToken};
+use caliptra_registers::mcu_mbox0::enums::MboxStatusE;
+pub use mcu_mgr::McuManager;
+pub use model_emulated::ModelEmulated;
+use rand::{rngs::StdRng, SeedableRng};
+use sha2::Digest;
+use std::io::Write;
+use std::io::{stdout, ErrorKind};
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+
+use caliptra_mcu_emulator_periph::TapDevice;
+use caliptra_ureg::MmioMut;
+pub use vmem::read_otp_vmem_data;
+use zerocopy::FromBytes;
+
+// Re-export flash image builder for creating flash images from firmware bytes
+pub use caliptra_mcu_builder::flash_image::build_flash_image_bytes;
+
+mod bus_logger;
+#[cfg(feature = "fpga_realtime")]
+pub mod debug_unlock;
+#[cfg(feature = "fpga_realtime")]
+pub mod flash_ctrl;
+mod fpga_regs;
+#[cfg(feature = "fpga_realtime")]
+pub mod jtag;
+#[cfg(feature = "fpga_realtime")]
+pub mod lcc;
+pub mod mcu_mbox_transport;
+mod mcu_mgr;
+mod model_emulated;
+#[cfg(feature = "fpga_realtime")]
+mod model_fpga_realtime;
+pub mod otp_provision;
+pub mod usb_ctrl;
+mod vmem;
+
+pub enum ShaAccMode {
+    Sha384Stream,
+    Sha512Stream,
+}
+
+#[cfg(feature = "fpga_realtime")]
+pub use model_fpga_realtime::ModelFpgaRealtime;
+
+/// Ideally, general-purpose functions would return `impl HwModel` instead of
+/// `DefaultHwModel` to prevent users from calling functions that aren't
+/// available on all HwModel implementations.
+///
+/// Unfortunately, rust-analyzer (used by IDEs) can't fully resolve associated
+/// types from `impl Trait`, so such functions should use `DefaultHwModel`.
+/// Users should treat `DefaultHwModel` as if it were `impl HwModel`.
+#[cfg(not(feature = "fpga_realtime"))]
+pub type DefaultHwModel = ModelEmulated;
+
+#[cfg(feature = "fpga_realtime")]
+pub type DefaultHwModel = ModelFpgaRealtime;
+
+// This is a random number, but should be kept in sync with what is the default value in the FPGA ROM.
+const DEFAULT_LIFECYCLE_RAW_TOKEN: LifecycleToken =
+    LifecycleToken(0x05edb8c608fcc830de181732cfd65e57u128.to_le_bytes());
+
+const DEFAULT_LIFECYCLE_RAW_TOKENS: LifecycleRawTokens = LifecycleRawTokens {
+    test_unlock: [DEFAULT_LIFECYCLE_RAW_TOKEN; 7],
+    manuf: DEFAULT_LIFECYCLE_RAW_TOKEN,
+    manuf_to_prod: DEFAULT_LIFECYCLE_RAW_TOKEN,
+    prod_to_prod_end: DEFAULT_LIFECYCLE_RAW_TOKEN,
+    rma: DEFAULT_LIFECYCLE_RAW_TOKEN,
+};
+
+/// Constructs an HwModel based on the cargo features and environment
+/// variables. Most test cases that need to construct a HwModel should use this
+/// function over HwModel::new_unbooted().
+///
+/// The model returned by this function does not have any fuses programmed and
+/// is not yet ready to execute code in the microcontroller. Most test cases
+/// should use [`new`] instead.
+pub fn new_unbooted(params: InitParams) -> Result<DefaultHwModel> {
+    let summary = params.summary();
+    DefaultHwModel::new_unbooted(params).inspect(|hw| {
+        println!("Using hardware-model {}", hw.type_name());
+        println!("{summary:#?}");
+    })
+}
+
+/// Constructs an HwModel based on the cargo features and environment variables,
+/// and boot it to the point where CPU execution can occur. This includes
+/// programming the fuses, initializing the boot_fsm state machine, and
+/// (optionally) uploading firmware. Most test cases that need to construct a
+/// HwModel should use this function over [`HwModel::new()`] and
+/// [`crate::new_unbooted`].
+pub fn new(init_params: InitParams) -> Result<DefaultHwModel> {
+    DefaultHwModel::new(init_params)
+}
+
+pub struct InitParams<'a> {
+    /// Fuse settings
+    pub fuses: Fuses,
+    /// The contents of the Caliptra ROM
+    pub caliptra_rom: &'a [u8],
+    /// Caliptra's firmware bundle.
+    pub caliptra_firmware: &'a [u8],
+    /// SoC manifest
+    pub soc_manifest: &'a [u8],
+    /// The contents of the MCU ROM
+    pub mcu_rom: &'a [u8],
+    /// The contents of the MCU firmware
+    pub mcu_firmware: &'a [u8],
+
+    /// The contents of the Network Coprocessor ROM
+    pub network_rom: &'a [u8],
+
+    /// TAP device for the Network Coprocessor Ethernet peripheral
+    pub network_tap_device: Option<Arc<Mutex<Box<dyn TapDevice>>>>,
+
+    /// The initial contents of the DCCM SRAM
+    pub caliptra_dccm: &'a [u8],
+
+    /// The initial contents of the ICCM SRAM
+    pub caliptra_iccm: &'a [u8],
+
+    /// The initial contents of the OTP memory
+    pub otp_memory: Option<&'a [u8]>,
+
+    /// The initial lifecycle controller state of the device.
+    /// This will override any otp_memory contents.
+    pub lifecycle_controller_state: Option<LifecycleControllerState>,
+
+    /// Lifecycle tokens (raw) to burn into the OTP memory.
+    /// This will override any otp_memory contents.
+    pub lifecycle_tokens: Option<LifecycleRawTokens>,
+
+    /// Vendor public key hash.
+    /// This will override any otp_memory contents.
+    pub vendor_pk_hash: Option<[u8; 48]>,
+    /// PQC key type for vendor public key.
+    /// This will override any otp_memory contents.
+    pub vendor_pqc_type: Option<FwVerificationPqcKeyType>,
+
+    pub log_writer: Box<dyn std::io::Write>,
+
+    pub dbg_manuf_service: DbgManufServiceRegReq,
+
+    pub active_mode: bool,
+    pub ocp_lock_en: bool,
+
+    // Keypairs for production debug unlock levels, from low to high
+    // ECC384 and MLDSA87 keypairs
+    pub prod_dbg_unlock_keypairs: Vec<(&'a [u8; 96], &'a [u8; 2592])>,
+
+    // Number of public key hashes for production debug unlock levels.
+    // Note: does not have to match number of keypairs in prod_dbg_unlock_keypairs above if default
+    // OTP settings are used.
+    pub num_prod_dbg_unlock_pk_hashes: u32,
+
+    // Offset of public key hashes in PROD_DEBUG_UNLOCK_PK_HASH_REG register bank for production debug unlock.
+    pub prod_dbg_unlock_pk_hashes_offset: u32,
+
+    pub bootfsm_break: bool,
+
+    pub rma_or_scrap_ppd: bool,
+
+    pub debug_intent: bool,
+
+    pub uds_program_req: bool,
+
+    // The silicon obfuscation key passed to caliptra_top.
+    pub cptra_obf_key: [u32; 8],
+
+    pub csr_hmac_key: [u32; 16],
+
+    pub uds_granularity_32: bool,
+
+    pub otp_dai_idle_bit_offset: u32,
+
+    pub otp_direct_access_cmd_reg_offset: u32,
+
+    // 4-bit nibbles of raw entropy to feed into the internal TRNG (ENTROPY_SRC
+    // peripheral).
+    pub itrng_nibbles: Box<dyn Iterator<Item = u8> + Send>,
+
+    // Pre-conditioned TRNG responses to return over the soc_ifc CPTRA_TRNG_DATA
+    // registers in response to requests via CPTRA_TRNG_STATUS
+    pub etrng_responses: Box<dyn Iterator<Item = EtrngResponse> + Send>,
+
+    // If true (and the HwModel supports it), initialize the SRAM with random
+    // data. This will likely result in a ECC double-bit error if the CPU
+    // attempts to read uninitialized memory.
+    pub random_sram_puf: bool,
+
+    // A trace path to use. If None, the CPTRA_TRACE_PATH environment variable
+    // will be used
+    pub trace_path: Option<PathBuf>,
+
+    // Information about the stack Caliptra is using. When set the emulator will check if the stack
+    // overflows.
+    pub stack_info: Option<StackInfo>,
+
+    // Consume MCU UART log with Caliptra UART log.
+    pub enable_mcu_uart_log: bool,
+
+    pub i3c_port: Option<u16>,
+
+    /// Initial contents of DOT flash.
+    pub dot_flash_initial_contents: Option<Vec<u8>>,
+
+    /// Initial contents of the primary flash (for flash-based boot testing).
+    pub primary_flash_initial_contents: Option<Vec<u8>>,
+
+    pub check_booted_to_runtime: bool,
+
+    pub rom_callback: Option<ModelCallback>,
+
+    pub flash_boot: bool,
+
+    /// When true, the emulator pre-sets the `FC_FIPS_ZEROZATION_STS` register
+    /// so that MCU ROM detects FIPS zeroization on cold boot.
+    pub fips_zeroization: bool,
+
+    /// Override the default AXI user that the model uses to access the Caliptra SoC interface.
+    pub caliptra_soc_axi_user: Option<u32>,
+
+    /// When true, drive the MCI generic input wire strap that forces the ROM
+    /// to use the `CPTRA_SS_OWNER_PK_HASH` fuse as the owner, bypassing DOT.
+    pub force_fuse_owner_pk_hash: bool,
+
+    pub active_i3c1: bool,
+
+    /// Initial contents of the vendor test partition in OTP.
+    pub vendor_test_partition: Option<Vec<u8>>,
+
+    /// When true, set secrets_valid so DOE reads UDS/FE from strap registers
+    /// for deterministic IDevID on FPGA (needed for attestation tests).
+    pub use_strap_secrets: bool,
+}
+
+impl InitParams<'_> {
+    pub fn summary(&self) -> InitParamsSummary {
+        InitParamsSummary {
+            rom_sha384: sha2::Sha384::digest(self.mcu_rom).into(),
+            obf_key: self.cptra_obf_key,
+        }
+    }
+}
+
+impl Default for InitParams<'_> {
+    fn default() -> Self {
+        let seed = std::env::var("CPTRA_TRNG_SEED")
+            .ok()
+            .and_then(|s| u64::from_str(&s).ok());
+        let itrng_nibbles: Box<dyn Iterator<Item = u8> + Send> = if let Some(seed) = seed {
+            Box::new(RandomNibbles(StdRng::seed_from_u64(seed)))
+        } else {
+            Box::new(RandomNibbles(StdRng::from_entropy()))
+        };
+        let etrng_responses: Box<dyn Iterator<Item = EtrngResponse> + Send> =
+            if let Some(seed) = seed {
+                Box::new(RandomEtrngResponses(StdRng::seed_from_u64(seed)))
+            } else {
+                Box::new(RandomEtrngResponses::new_from_stdrng())
+            };
+        Self {
+            fuses: Default::default(),
+            caliptra_rom: Default::default(),
+            caliptra_firmware: Default::default(),
+            mcu_rom: Default::default(),
+            mcu_firmware: Default::default(),
+            network_rom: Default::default(),
+            network_tap_device: None,
+            caliptra_dccm: Default::default(),
+            caliptra_iccm: Default::default(),
+            otp_memory: None,
+            lifecycle_controller_state: None,
+            lifecycle_tokens: None,
+            log_writer: Box::new(stdout()),
+            dbg_manuf_service: Default::default(),
+            uds_granularity_32: false, // 64-bit granularity
+            otp_dai_idle_bit_offset: 30,
+            otp_direct_access_cmd_reg_offset: 0x80,
+            bootfsm_break: false,
+            uds_program_req: false,
+            active_mode: false,
+            ocp_lock_en: false,
+            prod_dbg_unlock_keypairs: Default::default(),
+            // Leave these strap values at 0 so the MCU ROM is responsible for
+            // programming SS_NUM_OF_PROD_DEBUG_UNLOCK_AUTH_PK_HASHES and
+            // SS_PROD_DEBUG_UNLOCK_AUTH_PK_HASH_REG_BANK_OFFSET during cold
+            // boot.
+            num_prod_dbg_unlock_pk_hashes: 0,
+            prod_dbg_unlock_pk_hashes_offset: 0,
+            rma_or_scrap_ppd: false,
+            debug_intent: false,
+            cptra_obf_key: DEFAULT_CPTRA_OBF_KEY,
+            itrng_nibbles,
+            etrng_responses,
+            random_sram_puf: true,
+            trace_path: None,
+            stack_info: None,
+            enable_mcu_uart_log: false,
+            csr_hmac_key: [1; 16],
+            soc_manifest: Default::default(),
+            vendor_pk_hash: None,
+            vendor_pqc_type: None,
+            i3c_port: None,
+            dot_flash_initial_contents: None,
+            primary_flash_initial_contents: None,
+            check_booted_to_runtime: true,
+            rom_callback: None,
+            flash_boot: false,
+            fips_zeroization: false,
+            caliptra_soc_axi_user: None,
+            force_fuse_owner_pk_hash: false,
+            active_i3c1: false,
+            vendor_test_partition: None,
+            use_strap_secrets: false,
+        }
+    }
+}
+
+pub struct InitParamsSummary {
+    rom_sha384: [u8; 48],
+    obf_key: [u32; 8],
+}
+impl std::fmt::Debug for InitParamsSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InitParamsSummary")
+            .field("rom_sha384", &HexBytes(&self.rom_sha384))
+            .field("obf_key", &HexSlice(&self.obf_key))
+            .finish()
+    }
+}
+
+fn trace_path_or_env(trace_path: Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(trace_path) = trace_path {
+        return Some(trace_path);
+    }
+    std::env::var("CPTRA_TRACE_PATH").ok().map(PathBuf::from)
+}
+
+// Represents a emulator or simulation of the caliptra core hardware, to be called
+// from tests. Typically, test cases should use [`crate::new()`] to create a model
+// based on the cargo features (and any model-specific environment variables).
+pub trait McuHwModel {
+    /// Create a model. Most high-level tests should use [`new()`]
+    /// instead.
+    fn new_unbooted(params: InitParams) -> Result<Self>
+    where
+        Self: Sized;
+
+    /// Create a model, and boot it to the point where CPU execution can
+    /// occur. This includes programming the fuses, initializing the
+    /// boot_fsm state machine, and (optionally) uploading firmware.
+    fn new(init_params: InitParams) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        let init_params_summary = init_params.summary();
+
+        let mut hw: Self = McuHwModel::new_unbooted(init_params)?;
+        println!("Using hardware-model {}", hw.type_name());
+        println!("{init_params_summary:#?}");
+
+        hw.boot()?;
+
+        Ok(hw)
+    }
+
+    // TODO this should have a common boot function similar to the Caliptra HW model.
+    fn boot(&mut self) -> Result<()>
+    where
+        Self: Sized;
+
+    fn save_otp_memory(&self, path: &Path) -> Result<()>;
+    fn read_otp_memory(&self) -> Vec<u8>;
+
+    fn read_dot_flash(&self) -> Vec<u8>;
+    fn write_dot_flash(&mut self, data: &[u8]) -> Result<()>;
+
+    /// The type name of this model
+    fn type_name(&self) -> &'static str;
+
+    /// Step execution ahead one clock cycle.
+    fn step(&mut self);
+
+    fn cycle_count(&mut self) -> u64;
+
+    /// Any UART-ish output written by the microcontroller will be available here.
+    fn output(&mut self) -> &mut Output;
+
+    /// Execute until the result of `predicate` becomes true.
+    fn step_until(&mut self, mut predicate: impl FnMut(&mut Self) -> bool) {
+        while !predicate(self) {
+            self.step();
+        }
+    }
+
+    /// Returns true if the microcontroller has signalled that it is ready for
+    /// firmware to be written to the mailbox. For RTL implementations, this
+    /// should come via a caliptra_top wire rather than an APB register.
+    fn ready_for_fw(&self) -> bool;
+
+    fn step_until_exit_success(&mut self) -> std::io::Result<()> {
+        self.copy_output_until_exit_success(std::io::Sink::default())
+    }
+
+    fn mcu_manager(&mut self) -> impl McuManager;
+
+    fn caliptra_soc_manager(&mut self) -> impl SocManager;
+
+    fn start_i3c_controller(&mut self);
+
+    fn i3c_address(&self) -> Option<u8>;
+
+    fn i3c_port(&self) -> Option<u16>;
+
+    fn exit_status(&self) -> Option<ExitStatus> {
+        // tests trigger success by stopping the emulator or FPGA.
+        if !caliptra_mcu_testing_common::is_emulator_running() {
+            Some(ExitStatus::Passed)
+        } else {
+            None
+        }
+    }
+
+    fn copy_output_until_exit_success(
+        &mut self,
+        mut w: impl std::io::Write,
+    ) -> std::io::Result<()> {
+        loop {
+            if !self.output().peek().is_empty() {
+                w.write_all(self.output().take(usize::MAX).as_bytes())?;
+            }
+            match self.output().exit_status().or(self.exit_status()) {
+                Some(ExitStatus::Passed) => return Ok(()),
+                Some(ExitStatus::Failed) => {
+                    return Err(std::io::Error::new(
+                        ErrorKind::Other,
+                        "firmware exited with failure",
+                    ))
+                }
+                None => {}
+            }
+            // Check for fatal error in MCI register
+            if let Some(fatal_error) = self.mci_fw_fatal_error() {
+                return Err(std::io::Error::new(
+                    ErrorKind::Other,
+                    format!("firmware fatal error: 0x{:08x}", fatal_error),
+                ));
+            }
+            self.step();
+        }
+    }
+
+    fn step_until_exit_failure(&mut self) -> Result<()> {
+        loop {
+            match self.output().exit_status() {
+                Some(ExitStatus::Failed) => return Ok(()),
+                Some(ExitStatus::Passed) => {
+                    bail!("firmware exited with success when failure was expected",);
+                }
+                None => {}
+            }
+            self.step();
+        }
+    }
+
+    /// Execute until the output buffer starts with `expected_output`
+    fn step_until_output(&mut self, expected_output: &str) -> Result<()> {
+        self.step_until(|m| m.output().peek().len() >= expected_output.len());
+        if &self.output().peek()[..expected_output.len()] != expected_output {
+            bail!(
+                "expected output {:?}, was {:?}",
+                expected_output,
+                self.output().peek()
+            );
+        }
+        Ok(())
+    }
+
+    /// Execute until the output buffer starts with `expected_output`, and remove it
+    /// from the output buffer.
+    fn step_until_output_and_take(&mut self, expected_output: &str) -> Result<()> {
+        self.step_until_output(expected_output)?;
+        self.output().take(expected_output.len());
+        Ok(())
+    }
+
+    // Execute (at least) until the output provided substr is written to the
+    // output. Additional data may be present in the output after the provided
+    // substr, which often happens with the fpga_realtime hardware model.
+    //
+    // This function will not match any data in the output that was written
+    // before this function was called.
+    fn step_until_output_contains(&mut self, substr: &str) -> Result<()> {
+        self.output().set_search_term(substr);
+        self.step_until(|m| m.output().search_matched());
+        Ok(())
+    }
+
+    fn cover_fw_image(&mut self, _image: &[u8]) {}
+
+    fn tracing_hint(&mut self, enable: bool);
+
+    fn set_axi_user(&mut self, axi_user: u32);
+
+    fn set_itrng_divider(&mut self, _divider: u32) {}
+
+    fn set_generic_input_wires(&mut self, _value: &[u32; 2]) {}
+
+    fn set_mcu_generic_input_wires(&mut self, _value: &[u32; 2]) {}
+
+    fn set_caliptra_boot_go(&mut self, _value: bool) {}
+
+    fn events_from_caliptra(&mut self) -> Vec<Event>;
+
+    fn events_to_caliptra(&mut self) -> mpsc::Sender<Event>;
+
+    fn mci_flow_status(&mut self) -> u32 {
+        self.mcu_manager()
+            .with_mci(|mci| mci.fw_flow_status().read())
+    }
+
+    fn mci_boot_checkpoint(&mut self) -> u16 {
+        (self.mci_flow_status() & 0x0000_ffff) as u16
+    }
+
+    fn mci_boot_milestones(&mut self) -> McuBootMilestones {
+        McuBootMilestones::from((self.mci_flow_status() >> 16) as u16)
+    }
+
+    /// Reads `mci_reg_fw_extended_error_info[idx]` (8 × u32 scratch words
+    /// reserved for firmware-defined error/diagnostic data). Panics if
+    /// `idx >= 8`.
+    fn mci_fw_extended_error_info(&mut self, idx: usize) -> u32 {
+        assert!(idx < 8, "fw_extended_error_info has only 8 words");
+        self.mcu_manager()
+            .with_mci(|mci| mci.fw_extended_error_info().at(idx).read())
+    }
+
+    /// Executes a typed request and (on success), returns the typed response.
+    /// The checksum field of the request is calculated, and the checksum of the
+    /// response is validated.
+    fn mailbox_execute_req<R: caliptra_mcu_mbox_common::messages::Request>(
+        &mut self,
+        mut req: R,
+    ) -> Result<R::Resp> {
+        let req_bytes = req.as_mut_bytes();
+
+        // Populate the request checksum
+        let checksum = calc_checksum(R::ID.into(), &req_bytes[size_of::<i32>()..]);
+        let hdr: &mut MailboxReqHeader =
+            MailboxReqHeader::mut_from_bytes(&mut req_bytes[..size_of::<MailboxReqHeader>()])
+                .unwrap();
+        hdr.chksum = checksum;
+
+        // Send the request to the mailbox
+        let mut response = self
+            .mailbox_execute(R::ID.into(), req_bytes)?
+            .unwrap_or_default();
+
+        // Check the reponse checksum
+        if response.len() < 4 {
+            bail!("Response too short to contain checksum");
+        }
+        let received_chksum = u32::from_le_bytes(response[..4].try_into().unwrap());
+        let calculated_chksum = calc_checksum(0, &response[4..]);
+        if received_chksum != calculated_chksum {
+            bail!(
+                "Response checksum mismatch: expected {:08x}, calculated {:08x}",
+                received_chksum,
+                calculated_chksum
+            );
+        }
+
+        if response.len() < std::mem::size_of::<R::Resp>() {
+            response.resize(std::mem::size_of::<R::Resp>(), 0);
+        }
+        let response = R::Resp::read_from_bytes(&response).map_err(|_| {
+            anyhow!(
+                "Failed to read response into struct: expected len {}, response len {}",
+                std::mem::size_of::<R::Resp>(),
+                response.len()
+            )
+        })?;
+        Ok(response)
+    }
+
+    /// Executes `cmd` with request data `buf`. Returns `Ok(Some(_))` if
+    /// the uC responded with data, `Ok(None)` if the uC indicated success
+    /// without data, Err(ModelError::MailboxCmdFailed) if the microcontroller
+    /// responded with an error, or other model errors if there was a problem
+    /// communicating with the mailbox.
+    fn mailbox_execute(&mut self, cmd: u32, buf: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.start_mailbox_execute(cmd, buf)?;
+        self.finish_mailbox_execute()
+    }
+
+    /// Send a command to the mailbox but don't wait for the response
+    fn start_mailbox_execute(&mut self, cmd: u32, buf: &[u8]) -> Result<()> {
+        // Read a 0 to get the lock
+        while !(self.mcu_manager().mbox0().mbox_lock().read().lock()) {
+            self.step();
+        }
+
+        // Mailbox lock value should read 1 now
+        // If not, the reads are likely being blocked by the AXI_USER check or some other issue
+        if !(self.mcu_manager().mbox0().mbox_lock().read().lock()) {
+            bail!("Mailbox lock is not set");
+        }
+
+        println!(
+            "<<< Executing mbox cmd 0x{cmd:08x} ({} bytes) from SoC",
+            buf.len()
+        );
+
+        self.mcu_manager().with_mbox0(|mbox| {
+            mbox.mbox_cmd().write(|_| cmd);
+            mbox.mbox_dlen().write(|_| buf.len() as u32);
+
+            // Write the data to the mailbox SRAM. NOTE: all access to SRAM must be in words.
+            let len_words = buf.len() / size_of::<u32>();
+            let word_bytes = &buf[..len_words * size_of::<u32>()];
+            for (i, word) in word_bytes.chunks_exact(4).enumerate() {
+                let word = u32::from_le_bytes(word.try_into().unwrap());
+                mbox.mbox_sram().at(i).write(|_| word);
+            }
+
+            let remaining = &buf[word_bytes.len()..];
+            if !remaining.is_empty() {
+                let mut word_bytes = [0u8; 4];
+                word_bytes[..remaining.len()].copy_from_slice(remaining);
+                let word = u32::from_le_bytes(word_bytes);
+                mbox.mbox_sram().at(len_words).write(|_| word);
+            }
+
+            // Ask the microcontroller to execute this command
+            mbox.mbox_execute().write(|w| w.execute(true));
+        });
+
+        // The hardware does not send the interrupt because it thinks MCU controls the mailbox. We
+        // need to manually trigger it.
+        self.mcu_manager().with_mci(|mci| {
+            mci.intr_block_rf()
+                .notif0_intr_trig_r()
+                .write(|w| w.notif_mbox0_cmd_avail_trig(true));
+        });
+
+        Ok(())
+    }
+
+    fn cmd_status(&mut self) -> MboxStatusE {
+        self.mcu_manager()
+            .with_mbox0(|mbox| mbox.mbox_cmd_status().read().status())
+    }
+
+    /// Wait for the response to a previous call to `start_mailbox_execute()`.
+    fn finish_mailbox_execute(&mut self) -> Result<Option<Vec<u8>>> {
+        // Wait for the microcontroller to finish executing
+        let mut timeout_cycles = 40000000; // 100ms @400MHz
+        while self.cmd_status().cmd_busy() {
+            self.step();
+            timeout_cycles -= 1;
+            if timeout_cycles == 0 {
+                bail!("Mailbox command timed out");
+            }
+        }
+
+        let status = self.cmd_status();
+
+        if status.cmd_failure() {
+            println!(">>> mbox cmd response: failed");
+            self.mcu_manager().with_mbox0(|mbox| {
+                mbox.mbox_execute().write(|w| w.execute(false));
+            });
+            return self.mcu_manager().with_mci(|mci| {
+                let fatal = mci.fw_error_fatal().read();
+                if fatal != 0 {
+                    bail!("Fatal firmware error {fatal:08x}")
+                }
+                let non_fatal = mci.fw_error_non_fatal().read();
+                if non_fatal != 0 {
+                    bail!("Non-fatal firmware error {non_fatal:08x}")
+                }
+                bail!("Unknown firmware error")
+            });
+        }
+
+        self.mcu_manager().with_mbox0(|mbox| {
+            if status.cmd_complete() {
+                let dlen = mbox.mbox_dlen().read() as usize;
+                if dlen == 0 {
+                    println!(">>> mbox cmd response: success");
+                    mbox.mbox_execute().write(|w| w.execute(false));
+                    return Ok(None);
+                }
+            } else if !status.data_ready() {
+                bail!("Unknown mailbox status {:x}", u32::from(status));
+            }
+
+            let dlen = mbox.mbox_dlen().read() as usize;
+            let mut output = Vec::with_capacity(dlen);
+            println!(">>> mbox cmd response data ({dlen} bytes)");
+
+            // Read the output from the mailbox SRAM. NOTE: all access to SRAM must be in words.
+            let len_words = dlen / size_of::<u32>();
+            for i in 0..len_words {
+                let word = mbox.mbox_sram().at(i).read();
+                output.extend_from_slice(&word.to_le_bytes());
+            }
+
+            let remaining = dlen % size_of::<u32>();
+            if remaining > 0 {
+                let word = mbox.mbox_sram().at(len_words).read();
+                output.extend_from_slice(&word.to_le_bytes()[..remaining]);
+            }
+
+            mbox.mbox_execute().write(|w| w.execute(false));
+            Ok(Some(output))
+        })
+    }
+
+    fn mci_fw_fatal_error(&mut self) -> Option<u32> {
+        Some(self.mcu_manager().mci().fw_error_fatal().read()).filter(|&e| e != 0)
+    }
+
+    /// Returns true if the network CPU is initialized.
+    fn has_network_cpu(&self) -> bool {
+        false
+    }
+
+    /// Get the network CPU UART output, if available.
+    fn network_uart_output(&self) -> Option<String> {
+        None
+    }
+
+    fn warm_reset(&mut self);
+
+    /// Executes Caliptra`cmd` with request data `buf`. Returns `Ok(Some(_))` if
+    /// the uC responded with data, `Ok(None)` if the uC indicated success
+    /// without data, Err(ModelError::MailboxCmdFailed) if the microcontroller
+    /// responded with an error, or other model errors if there was a problem
+    /// communicating with the mailbox.
+    fn caliptra_mailbox_execute(
+        &mut self,
+        cmd: u32,
+        buf: &[u8],
+    ) -> std::result::Result<Option<Vec<u8>>, ModelError> {
+        self.caliptra_start_mailbox_execute(cmd, buf)?;
+        self.caliptra_finish_mailbox_execute()
+    }
+
+    /// Send a command to the Caliptra mailbox but don't wait for the response
+    fn caliptra_start_mailbox_execute(
+        &mut self,
+        cmd: u32,
+        buf: &[u8],
+    ) -> std::result::Result<(), ModelError> {
+        // Read a 0 to get the lock
+        if self.caliptra_soc_manager().soc_mbox().lock().read().lock() {
+            return Err(ModelError::UnableToLockMailbox);
+        }
+
+        // Mailbox lock value should read 1 now
+        // If not, the reads are likely being blocked by the AXI_USER check or some other issue
+        if !(self.caliptra_soc_manager().soc_mbox().lock().read().lock()) {
+            return Err(ModelError::UnableToReadMailbox);
+        }
+
+        writeln!(
+            self.output().logger(),
+            "<<< Executing Caliptra mbox cmd 0x{cmd:08x} ({} bytes) from SoC",
+            buf.len(),
+        )
+        .unwrap();
+
+        self.caliptra_soc_manager().soc_mbox().cmd().write(|_| cmd);
+        mbox_write_fifo(&self.caliptra_soc_manager().soc_mbox(), buf).map_err(ModelError::from)?;
+
+        // Ask the microcontroller to execute this command
+        self.caliptra_soc_manager()
+            .soc_mbox()
+            .execute()
+            .write(|w| w.execute(true));
+
+        Ok(())
+    }
+
+    /// Wait for the response to a previous call to `start_mailbox_execute()`.
+    fn caliptra_finish_mailbox_execute(
+        &mut self,
+    ) -> std::result::Result<Option<Vec<u8>>, ModelError> {
+        // Wait for the microcontroller to finish executing
+        let mut timeout_cycles = 40_000_000; // 100ms @400MHz
+        while self
+            .caliptra_soc_manager()
+            .soc_mbox()
+            .status()
+            .read()
+            .status()
+            .cmd_busy()
+        {
+            self.step();
+            timeout_cycles -= 1;
+            if timeout_cycles == 0 {
+                return Err(ModelError::MailboxTimeout);
+            }
+        }
+        let status = self
+            .caliptra_soc_manager()
+            .soc_mbox()
+            .status()
+            .read()
+            .status();
+        if status.cmd_failure() {
+            writeln!(
+                self.output().logger(),
+                ">>> Caliptra mbox cmd response: failed"
+            )
+            .unwrap();
+            self.caliptra_soc_manager()
+                .soc_mbox()
+                .execute()
+                .write(|w| w.execute(false));
+            let mut soc_mgr = self.caliptra_soc_manager();
+            let soc_ifc = soc_mgr.soc_ifc();
+            return Err(ModelError::MailboxCmdFailed(
+                if soc_ifc.cptra_fw_error_fatal().read() != 0 {
+                    soc_ifc.cptra_fw_error_fatal().read()
+                } else {
+                    soc_ifc.cptra_fw_error_non_fatal().read()
+                },
+            ));
+        }
+        if status.cmd_complete() {
+            writeln!(
+                self.output().logger(),
+                ">>> Caliptra mbox cmd response: success"
+            )
+            .unwrap();
+            self.caliptra_soc_manager()
+                .soc_mbox()
+                .execute()
+                .write(|w| w.execute(false));
+            return Ok(None);
+        }
+        if !status.data_ready() {
+            return Err(ModelError::UnknownCommandStatus(status as u32));
+        }
+
+        let dlen = self.caliptra_soc_manager().soc_mbox().dlen().read();
+        writeln!(
+            self.output().logger(),
+            ">>> mbox cmd response data ({dlen} bytes)"
+        )
+        .unwrap();
+        let result = mbox_read_fifo(self.caliptra_soc_manager().soc_mbox());
+
+        self.caliptra_soc_manager()
+            .soc_mbox()
+            .execute()
+            .write(|w| w.execute(false));
+
+        if cfg!(not(any(feature = "fpga_realtime",))) {
+            // Don't check for mbox_idle() unless the hw-model supports
+            // fine-grained timing control; the firmware may proceed to lock the
+            // mailbox shortly after the mailbox transcation finishes.
+
+            // mbox_fsm_ps isn't updated immediately after execute is cleared (!?),
+            // so step an extra clock cycle to wait for fm_ps to update
+            self.step();
+            assert!(self
+                .caliptra_soc_manager()
+                .soc_mbox()
+                .status()
+                .read()
+                .mbox_fsm_ps()
+                .mbox_idle());
+        }
+        Ok(Some(result))
+    }
+}
+
+fn mbox_read_fifo(mbox: caliptra_registers::mbox::RegisterBlock<impl MmioMut>) -> Vec<u8> {
+    let dlen = mbox.dlen().read() as usize;
+    let mut buf = vec![0; dlen];
+    let _ = caliptra_api::mailbox::mbox_read_fifo(mbox, buf.as_mut_slice());
+    buf
+}
+
+#[ignore]
+#[test]
+fn reg_access_test() {
+    let binaries = caliptra_mcu_builder::FirmwareBinaries::from_env().unwrap();
+
+    // Build flash image from firmware binaries
+    let flash_image = build_flash_image_bytes(
+        Some(&binaries.caliptra_fw),
+        Some(&binaries.soc_manifest),
+        Some(&binaries.mcu_runtime),
+    );
+
+    let mut hw = new(InitParams {
+        fuses: Fuses {
+            fuse_pqc_key_type: FwVerificationPqcKeyType::LMS as u32,
+            vendor_pk_hash: {
+                let mut vendor_pk_hash = [0u32; 12];
+                binaries
+                    .vendor_pk_hash()
+                    .unwrap()
+                    .chunks(4)
+                    .enumerate()
+                    .for_each(|(i, chunk)| {
+                        let mut array = [0u8; 4];
+                        array.copy_from_slice(chunk);
+                        vendor_pk_hash[i] = u32::from_be_bytes(array);
+                    });
+                vendor_pk_hash
+            },
+            ..Default::default()
+        },
+        caliptra_rom: &binaries.caliptra_rom,
+        mcu_rom: &binaries.mcu_rom,
+        vendor_pk_hash: binaries.vendor_pk_hash(),
+        active_mode: true,
+        vendor_pqc_type: Some(FwVerificationPqcKeyType::LMS),
+        primary_flash_initial_contents: Some(flash_image),
+        ..Default::default()
+    })
+    .unwrap();
+
+    assert_eq!(
+        hw.caliptra_soc_manager()
+            .soc_ifc()
+            .cptra_fw_error_fatal()
+            .read(),
+        0
+    );
+
+    // Check Caliptra reports 2.x
+    assert_eq!(
+        u32::from(hw.caliptra_soc_manager().soc_ifc().cptra_hw_rev_id().read()),
+        2
+    );
+
+    let mut mcu_mgr = hw.mcu_manager();
+
+    // // Check the I3C periph reports the right HCI version
+    assert_eq!(mcu_mgr.i3c().i3c_base().hci_version().read(), 0x120);
+
+    // Check the MCU HW generation reports 1.0.0
+    assert_eq!(mcu_mgr.mci().hw_rev_id().read().mc_generation(), 0x1000);
+
+    // Check the OTP periph reports idle
+    assert!(mcu_mgr.otp_ctrl().status().read().dai_idle());
+
+    // TODO: Check the LC periph reports correct revision
+    // assert_eq!(u32::from(mcu_mgr.lc_ctrl().hw_revision0().read()), 0x0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use caliptra_mcu_builder::{firmware, CaliptraBuildArgs};
+
+    fn platform() -> &'static str {
+        if cfg!(feature = "fpga_realtime") {
+            "fpga"
+        } else {
+            "emulator"
+        }
+    }
+
+    #[test]
+    pub fn test_mailbox_execute() -> Result<()> {
+        let mcu_rom = if let Ok(binaries) = caliptra_mcu_builder::FirmwareBinaries::from_env() {
+            binaries.test_rom(&firmware::hw_model_tests::MAILBOX_RESPONDER)?
+        } else {
+            let rom_file = caliptra_mcu_builder::test_rom_build(&CaliptraBuildArgs {
+                platform: Some(platform()),
+                fwid: Some(&firmware::hw_model_tests::MAILBOX_RESPONDER),
+                ..Default::default()
+            })?;
+            std::fs::read(&rom_file)?
+        };
+
+        let mut model = new(InitParams {
+            mcu_rom: &mcu_rom,
+            ..Default::default()
+        })?;
+
+        // Send command that echoes the command and input message
+        assert_eq!(
+            model.mailbox_execute(0x1000_0000, &[])?,
+            Some(vec![0x00, 0x00, 0x00, 0x10]),
+        );
+
+        let message: [u8; 10] = [0x90, 0x5e, 0x1f, 0xad, 0x8b, 0x60, 0xb0, 0xbf, 0x1c, 0x7e];
+
+        // Send command that echoes the command and input message
+        assert_eq!(
+            model.mailbox_execute(0x1000_0000, &message)?,
+            Some([[0x00, 0x00, 0x00, 0x10].as_slice(), &message].concat()),
+        );
+
+        // Send command that echoes the command and input message that is word aligned
+        assert_eq!(
+            model.mailbox_execute(0x1000_0000, &message[..8])?,
+            Some(vec![
+                0x00, 0x00, 0x00, 0x10, 0x90, 0x5e, 0x1f, 0xad, 0x8b, 0x60, 0xb0, 0xbf
+            ]),
+        );
+
+        // Send command that returns 7 bytes of output
+        assert_eq!(
+            model.mailbox_execute(0x1000_1000, &[])?,
+            Some(vec![0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd])
+        );
+
+        // Send command that returns 7 bytes of output, and doesn't consume input
+        assert_eq!(
+            model.mailbox_execute(0x1000_1000, &[42])?,
+            Some(vec![0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd]),
+        );
+
+        // TODO(zhalvorsen): doorbell commands seem to be hanging the interrupt controller.
+        // Re-enable these when it is working correctly.
+
+        // // Send command that returns 0 bytes of output
+        // assert_eq!(model.mailbox_execute(0x1000_2000, &[])?, Some(vec![]));
+
+        // // Send command that returns success with no output
+        // assert_eq!(model.mailbox_execute(0x2000_0000, &[])?, None);
+
+        // Send command that returns failure
+        assert!(model.mailbox_execute(0x4000_0000, &message).is_err());
+        Ok(())
+    }
+
+    #[cfg(not(feature = "fpga_realtime"))]
+    #[test]
+    pub fn test_usb_loopback() -> Result<()> {
+        let mcu_rom = if let Ok(binaries) = caliptra_mcu_builder::FirmwareBinaries::from_env() {
+            binaries.test_rom(&firmware::hw_model_tests::USB_RESPONDER)?
+        } else {
+            let rom_file = caliptra_mcu_builder::test_rom_build(&CaliptraBuildArgs {
+                platform: Some(platform()),
+                fwid: Some(&firmware::hw_model_tests::USB_RESPONDER),
+                ..Default::default()
+            })?;
+            std::fs::read(&rom_file)?
+        };
+
+        let mut model = new(InitParams {
+            mcu_rom: &mcu_rom,
+            check_booted_to_runtime: false,
+            ..Default::default()
+        })?;
+
+        let host = model.usb_host_controller.clone();
+
+        // Run the CPU until the firmware sets usbctrl.enable
+        for _ in 0..10_000_000 {
+            model.step();
+            if host.device_enabled() {
+                break;
+            }
+        }
+        assert!(host.device_enabled(), "firmware did not enable USB device");
+
+        // Test 1: SETUP echo
+        let setup_data = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x40, 0x00];
+        host.host_setup(0, &setup_data).unwrap();
+
+        // Step the CPU until it processes the packet and prepares a response
+        let mut in_data = None;
+        for _ in 0..1_000_000 {
+            model.step();
+            match host.host_in(0) {
+                Ok(data) => {
+                    in_data = Some(data);
+                    break;
+                }
+                Err(caliptra_mcu_emulator_periph::UsbTransactionError::Nak) => continue,
+                Err(e) => panic!("unexpected error from host_in: {:?}", e),
+            }
+        }
+        let in_data = in_data.expect("firmware did not respond to SETUP with IN data");
+        assert_eq!(in_data, setup_data, "SETUP echo mismatch");
+
+        // Test 2: OUT echo with a different payload
+        let out_payload = [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE];
+        host.host_out(0, &out_payload).unwrap();
+
+        let mut in_data = None;
+        for _ in 0..1_000_000 {
+            model.step();
+            match host.host_in(0) {
+                Ok(data) => {
+                    in_data = Some(data);
+                    break;
+                }
+                Err(caliptra_mcu_emulator_periph::UsbTransactionError::Nak) => continue,
+                Err(e) => panic!("unexpected error from host_in: {:?}", e),
+            }
+        }
+        let in_data = in_data.expect("firmware did not respond to OUT with IN data");
+        assert_eq!(in_data, out_payload, "OUT echo mismatch");
+
+        Ok(())
+    }
+
+    #[cfg(not(feature = "fpga_realtime"))]
+    #[test]
+    pub fn test_usb_ocp_recovery() -> Result<()> {
+        let mcu_rom = if let Ok(binaries) = caliptra_mcu_builder::FirmwareBinaries::from_env() {
+            binaries.test_rom(&firmware::hw_model_tests::USB_OCP_RECOVERY)?
+        } else {
+            let rom_file = caliptra_mcu_builder::test_rom_build(&CaliptraBuildArgs {
+                platform: Some(platform()),
+                fwid: Some(&firmware::hw_model_tests::USB_OCP_RECOVERY),
+                ..Default::default()
+            })?;
+            std::fs::read(&rom_file)?
+        };
+
+        let mut model = new(InitParams {
+            mcu_rom: &mcu_rom,
+            check_booted_to_runtime: false,
+            ..Default::default()
+        })?;
+
+        let host = model.usb_host_controller.clone();
+
+        // Wait for firmware to enable USB
+        for _ in 0..10_000_000 {
+            model.step();
+            if host.device_enabled() {
+                break;
+            }
+        }
+        assert!(host.device_enabled(), "firmware did not enable USB device");
+
+        // Trigger a bus reset so the firmware can proceed past its LinkReset wait.
+        host.bus_reset();
+
+        use crate::usb_ctrl::*;
+        use caliptra_mcu_ocp::protocol::device_status::{
+            DeviceStatus, DeviceStatusValue, ProtocolError, RecoveryReasonCode,
+        };
+        use caliptra_mcu_ocp::protocol::prot_cap::{self, ProtCap, RecoveryProtocolCapabilities};
+        use caliptra_mcu_ocp::protocol::RecoveryCommand;
+        use zerocopy::IntoBytes;
+
+        const TIMEOUT: usize = 1_000_000;
+
+        enumerate(&mut model, &host, TIMEOUT);
+
+        // --- OCP Recovery Commands ---
+
+        // PROT_CAP read
+        let mut expected_caps = RecoveryProtocolCapabilities(0);
+        expected_caps.set_identification(true);
+        expected_caps.set_device_status(true);
+        expected_caps.set_push_c_image_support(true);
+        expected_caps.set_recovery_memory_access(true);
+        let expected_prot_cap = ProtCap::new(1, 0, expected_caps, 1, 0, 0);
+
+        let setup = ocp_read(RecoveryCommand::ProtCap, prot_cap::RESPONSE_LEN as u16);
+        poll_setup(&mut model, &host, &setup, TIMEOUT);
+        let prot_cap = poll_in(&mut model, &host, TIMEOUT);
+        assert_eq!(prot_cap, expected_prot_cap.as_bytes(), "PROT_CAP mismatch");
+        poll_out(&mut model, &host, &[], TIMEOUT);
+
+        // DEVICE_STATUS read
+        let expected_ds = DeviceStatus::new(
+            DeviceStatusValue::StatusPending,
+            ProtocolError::NoError,
+            RecoveryReasonCode::NoBootFailure,
+            0,
+            &[],
+        )
+        .unwrap();
+        let mut expected_ds_buf = [0u8; 7];
+        let expected_ds_len = expected_ds.to_message(&mut expected_ds_buf).unwrap();
+
+        let setup = ocp_read(RecoveryCommand::DeviceStatus, expected_ds_len as u16);
+        poll_setup(&mut model, &host, &setup, TIMEOUT);
+        let status = poll_in(&mut model, &host, TIMEOUT);
+        assert_eq!(
+            status,
+            &expected_ds_buf[..expected_ds_len],
+            "DEVICE_STATUS mismatch"
+        );
+        poll_out(&mut model, &host, &[], TIMEOUT);
+
+        // Unsupported read (Vendor) → expect STALL
+        let setup = ocp_read(RecoveryCommand::Vendor, 4);
+        poll_setup(&mut model, &host, &setup, TIMEOUT);
+        poll_in_stall(&mut model, &host, TIMEOUT);
+
+        Ok(())
+    }
+}

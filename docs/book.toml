@@ -1,0 +1,22 @@
+# Licensed under the Apache-2.0 license
+
+[book]
+authors = ["Caliptra Authors"]
+language = "en"
+multilingual = false
+src = "src"
+title = "Caliptra MCU Firmware Documentation"
+
+[preprocessor]
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
+
+[preprocessor.plantuml]
+plantuml-cmd = "java -jar ./plantuml-asl-1.2025.7.jar"
+
+
+[output]
+
+[output.html]
+additional-js = ["mermaid.min.js", "mermaid-init.js"]

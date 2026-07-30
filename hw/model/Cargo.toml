@@ -1,0 +1,70 @@
+# Licensed under the Apache-2.0 license
+
+[package]
+name = "caliptra-mcu-hw-model"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = ["coverage"]
+coverage = ["dep:caliptra-mcu-coverage"]
+fpga_realtime = [
+    "dep:uio",
+    "dep:caliptra-mcu-config-fpga",
+    "caliptra-hw-model/fpga_subsystem",
+]
+itrng = []
+
+[dependencies]
+anyhow.workspace = true
+bitfield.workspace = true
+caliptra-api-types.workspace = true
+caliptra-api.workspace = true
+caliptra-emu-bus.workspace = true
+caliptra-emu-cpu.workspace = true
+caliptra-emu-periph.workspace = true
+caliptra-emu-types.workspace = true
+caliptra-hw-model-types.workspace = true
+caliptra-hw-model.workspace = true
+caliptra-image-types = { workspace = true, features = ["std"] }
+caliptra-registers.workspace = true
+ecdsa.workspace = true
+caliptra-mcu-emulator-bmc.workspace = true
+caliptra-mcu-emulator-caliptra.workspace = true
+caliptra-mcu-coverage = { workspace = true, optional = true }
+caliptra-mcu-emulator-consts.workspace = true
+caliptra-mcu-emulator-periph.workspace = true
+caliptra-mcu-emulator-registers-generated.workspace = true
+fips204.workspace = true
+hex.workspace = true
+int-enum.workspace = true
+libc.workspace = true
+caliptra-mcu-builder.workspace = true
+caliptra-mcu-config-emulator.workspace = true
+caliptra-mcu-config-fpga = { workspace = true, optional = true }
+caliptra-mcu-config.workspace = true
+caliptra-mcu-mbox-common.workspace = true
+caliptra-mcu-rom-common.workspace = true
+caliptra-mcu-testing-common.workspace = true
+caliptra-mcu-otp-lifecycle = { workspace = true, features = ["sha3", "std"] }
+caliptra-mcu-ocp.workspace = true
+caliptra-mcu-network-config.workspace = true
+p384.workspace = true
+caliptra-mcu-poll-common.workspace = true
+rand.workspace = true
+caliptra-mcu-registers-generated.workspace = true
+caliptra-mcu-romtime.workspace = true
+semver.workspace = true
+sha2.workspace = true
+sha3.workspace = true
+thiserror.workspace = true
+tock-registers.workspace = true
+uio = { workspace = true, optional = true }
+caliptra-ureg.workspace = true
+zerocopy.workspace = true
+
+[dev-dependencies]
+caliptra-builder.workspace = true
+caliptra-registers.workspace = true
+caliptra-test-harness-types.workspace = true
+nix.workspace = true

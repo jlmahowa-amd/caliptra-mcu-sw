@@ -1,0 +1,24 @@
+# Licensed under the Apache-2.0 license
+
+[package]
+name = "caliptra-mcu-emulator-caliptra"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+caliptra-api-types.workspace = true
+caliptra-emu-bus.workspace = true
+caliptra-emu-cpu.workspace = true
+caliptra-emu-periph.workspace = true
+caliptra-hw-model-types.workspace = true
+caliptra-registers.workspace = true
+clap.workspace = true
+ctrlc.workspace = true
+elf.workspace = true
+caliptra-mcu-emulator-consts.workspace = true
+gdbstub_arch.workspace = true
+gdbstub.workspace = true
+hex.workspace = true
+tock-registers.workspace = true

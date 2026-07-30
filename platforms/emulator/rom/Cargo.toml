@@ -1,0 +1,58 @@
+# Licensed under the Apache-2.0 license
+
+[package]
+name = "caliptra-mcu-rom-emulator"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[build-dependencies]
+caliptra-mcu-builder.workspace = true
+caliptra-mcu-config-emulator.workspace = true
+
+[dependencies]
+bitfield.workspace = true
+caliptra-mcu-config.workspace = true
+caliptra-mcu-config-emulator.workspace = true
+caliptra-mcu-error.workspace = true
+caliptra-mcu-usb-emulator.workspace = true
+caliptra-mcu-ocp.workspace = true
+caliptra-mcu-image-header.workspace = true
+caliptra-mcu-rom-common.workspace = true
+caliptra-mcu-registers-generated.workspace = true
+caliptra-mcu-romtime.workspace = true
+tock-registers.workspace = true
+zeroize.workspace = true
+zerocopy.workspace = true
+
+[target.'cfg(target_arch = "riscv32")'.dependencies]
+riscv-csr.workspace = true
+rv32i.workspace = true
+
+[features]
+default = []
+core_test = ["caliptra-mcu-rom-common/core_test"]
+ocp-lock = ["caliptra-mcu-rom-common/ocp-lock"]
+stable-owner-key = ["caliptra-mcu-rom-common/stable-owner-key"]
+hw-2-1 = ["caliptra-mcu-rom-common/hw-2-1"]
+cfi = ["caliptra-mcu-rom-common/cfi"]
+test-dot-recovery = []
+test-firmware-update-flash = ["test-flash-based-boot"]
+test-firmware-update-streaming = []
+test-mcu-rom-flash-access = []
+test-mcu-svn-gt-fuse = []
+test-mcu-svn-lt-fuse = []
+test-flash-based-boot = ["hw-2-1"]
+test-fw-manifest-dot = ["caliptra-mcu-rom-common/fw-manifest-dot"]
+test-fw-manifest-dot-hitless = [
+    "caliptra-mcu-rom-common/fw-manifest-dot",
+    "caliptra-mcu-rom-common/test-force-hitless-update",
+]
+test-svn-manifest = ["caliptra-mcu-rom-common/svn-manifest"]
+test-pldm-streaming-boot = []
+test-ocp-lock = []
+test-streaming-boot-flash-write-back = []
+active-i3c1 = ["caliptra-mcu-config-emulator/active-i3c1"]
+test-i3c-services = ["caliptra-mcu-rom-common/test-i3c-services"]
+test-rom-hooks = []
+test-usb-ocp-recovery = ["hw-2-1"]

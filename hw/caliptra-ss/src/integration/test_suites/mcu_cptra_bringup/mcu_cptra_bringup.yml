@@ -1,0 +1,6 @@
+---
+seed: 1
+testname: mcu_cptra_bringup
+pre-exec: |
+  echo "Running pre_exec for [mcu_cptra_bringup]"
+  make -f $CALIPTRA_SS_ROOT/tools/scripts/Makefile TESTNAME=mcu_cptra_bringup CALIPTRA_TESTNAME=cptra_bringup CALIPTRA_AUX=soc_ifc_ss mcu_program.hex cptra_program.hex

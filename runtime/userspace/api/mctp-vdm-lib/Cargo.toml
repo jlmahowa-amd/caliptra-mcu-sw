@@ -1,0 +1,28 @@
+# Licensed under the Apache-2.0 license
+
+[package]
+name = "caliptra-mcu-mctp-vdm-lib"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+embassy-executor.workspace = true
+embassy-sync.workspace = true
+caliptra-mcu-common-commands.workspace = true
+caliptra-mcu-libsyscall-caliptra.workspace = true
+caliptra-mcu-libtockasync.workspace = true
+caliptra-mcu-libtock_alarm.workspace = true
+caliptra-mcu-libtock_console.workspace = true
+caliptra-mcu-libtock_platform.workspace = true
+caliptra-mcu-libtock_runtime.workspace = true
+caliptra-mcu-mctp-vdm-common.workspace = true
+zerocopy.workspace = true
+
+[target.'cfg(not(target_arch = "riscv32"))'.dependencies]
+caliptra-mcu-libtock_unittest.workspace = true
+
+[target.'cfg(target_arch = "riscv32")'.dependencies]
+embassy-executor = { version = "0.9.1", features = ["arch-riscv32"] }
+embedded-alloc.workspace = true

@@ -1,0 +1,105 @@
+# Licensed under the Apache-2.0 license
+
+[package]
+name = "caliptra-mcu-example-app"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+caliptra-api.workspace = true
+caliptra-error.workspace = true
+caliptra-auth-man-types.workspace = true
+critical-section.workspace = true
+embassy-executor.workspace = true
+caliptra-mcu-libapi-caliptra.workspace = true
+caliptra-mcu-libsyscall-caliptra.workspace = true
+const-oid.workspace = true
+der.workspace = true
+spki.workspace = true
+caliptra-mcu-libtock_alarm.workspace = true
+caliptra-mcu-libtock_console.workspace = true
+caliptra-mcu-libtock_debug_panic.workspace = true
+caliptra-mcu-libtock_platform.workspace = true
+caliptra-mcu-libtock_runtime.workspace = true
+caliptra-mcu-libtock.workspace = true
+caliptra-mcu-libtockasync.workspace = true
+caliptra-mcu-config-emulator.workspace = true
+caliptra-mcu-config-fpga.workspace = true
+caliptra-mcu-pldm-common.workspace = true
+portable-atomic.workspace = true
+caliptra-mcu-romtime.workspace = true
+zerocopy.workspace = true
+
+[target.'cfg(not(target_arch = "riscv32"))'.dependencies]
+caliptra-mcu-libtock_unittest.workspace = true
+
+[target.'cfg(target_arch = "riscv32")'.dependencies]
+embassy-executor = { version = "0.9.1", features = ["arch-riscv32"] }
+embedded-alloc.workspace = true
+
+[features]
+default = []
+debug = []
+doe = []
+hw-2-1 = []
+ocp-lock = ["caliptra-mcu-libapi-caliptra/ocp-lock", "caliptra-mcu-romtime/ocp-lock"]
+# No-op stub forwarded through `runtime_build_with_apps`; size optimization
+# lives in `mcu-runtime-emulator`/`mcu-runtime-fpga`.
+release = []
+test-caliptra-certs = []
+test-caliptra-crypto = []
+test-caliptra-mailbox = []
+test-caliptra-util-host-validator = []
+test-dma = []
+test-doe-transport-loopback = []
+test-doe-discovery = []
+test-doe-user-loopback = []
+test-exit-immediately = []
+test-external-otp = []
+test-get-device-state = []
+test-i3c-simple = []
+test-i3c-constant-writes = []
+test-flash-based-boot = []
+test-flash-ctrl-init = []
+test-flash-ctrl-read-write-page = []
+test-flash-ctrl-erase-page = []
+test-flash-storage-read-write = []
+test-flash-storage-erase = []
+test-flash-usermode = []
+test-log-flash-circular = []
+test-log-flash-linear = []
+test-log-flash-usermode = []
+test-defmt-logging-mailbox = []
+test-defmt-logging-vdm = []
+test-firmware-update-flash = []
+test-firmware-update-streaming = []
+test-fpga-flash-ctrl = []
+test-mbox-sram = []
+test-mci = []
+test-mctp-ctrl-cmds = []
+test-mctp-capsule-loopback = []
+test-mctp-user-loopback = []
+test-mcu-mbox-driver = []
+test-mcu-mbox-soc-requester-loopback = []
+test-mcu-mbox-usermode = []
+test-mcu-mbox-cmds = []
+test-mcu-rom-flash-access = []
+test-mcu-svn-gt-fuse = []
+test-mcu-svn-lt-fuse = []
+test-ocp-lock = ["caliptra-mcu-libapi-caliptra/ocp-lock", "caliptra-mcu-romtime/ocp-lock"]
+test-pldm-request-response = []
+test-pldm-discovery = []
+test-pldm-fw-update = []
+test-pldm-fw-update-e2e = []
+test-pldm-streaming-boot = []
+test-streaming-boot-flash-write-back = []
+test-mctp-spdm-responder-conformance = []
+test-mctp-spdm-attestation = []
+test-mctp-spdm-attestation-pcr-quote = []
+test-mctp-spdm-set-certificate = []
+test-doe-spdm-responder-conformance = []
+test-doe-spdm-tdisp-ide-validator = []
+test-warm-reset = []
+active-i3c1 = []

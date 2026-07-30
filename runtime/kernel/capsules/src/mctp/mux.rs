@@ -1,0 +1,397 @@
+// Licensed under the Apache-2.0 license
+
+use crate::mctp::base_protocol::{
+    supported_msg_types, MCTPHeader, MessageType, MCTP_BASELINE_TRANSMISSION_UNIT, MCTP_HDR_SIZE,
+};
+use crate::mctp::control_msg::process_mctp_control_msg;
+use crate::mctp::recv::MCTPRxState;
+use crate::mctp::send::MCTPTxState;
+use crate::mctp::transport_binding::{MCTPTransportBinding, TransportRxClient, TransportTxClient};
+use caliptra_mcu_romtime::println;
+use core::cell::Cell;
+use kernel::collections::list::List;
+
+use kernel::deferred_call::{DeferredCall, DeferredCallClient};
+use kernel::hil::time::{Alarm, Ticks};
+use kernel::utilities::cells::TakeCell;
+use kernel::utilities::leasable_buffer::SubSliceMut;
+use kernel::ErrorCode;
+
+/// MUX struct that manages multiple MCTP driver users (clients).
+///
+/// This struct implements a FIFO queue for the
+/// transmitted and received request states.
+/// The virtualized upper layer ensures that only
+/// one message is transmitted per driver instance at a time.
+/// Receive is event based. The received packet in the rx buffer is
+/// matched against the pending receive requests.
+pub struct MuxMCTPDriver<'a, A: Alarm<'a>, M: MCTPTransportBinding<'a>> {
+    mctp_device: &'a dyn MCTPTransportBinding<'a>,
+    next_msg_tag: Cell<u8>, //global msg tag. increment by 1 for next tag upto 7 and wrap around.
+    local_eid: Cell<u8>,
+    mtu: Cell<usize>,
+    // List of outstanding send requests
+    sender_list: List<'a, MCTPTxState<'a, A, M>>,
+    receiver_list: List<'a, MCTPRxState<'a>>,
+    tx_pkt_buffer: TakeCell<'static, [u8]>, // Static buffer for tx packet.
+    rx_pkt_buffer: TakeCell<'static, [u8]>, //Static buffer for rx packet
+    clock: &'a A,
+    deferred_call: DeferredCall,
+}
+
+impl<'a, A: Alarm<'a>, M: MCTPTransportBinding<'a>> MuxMCTPDriver<'a, A, M> {
+    pub fn new(
+        mctp_device: &'a dyn MCTPTransportBinding<'a>,
+        local_eid: u8,
+        mtu: usize,
+        tx_pkt_buf: &'static mut [u8],
+        rx_pkt_buf: &'static mut [u8],
+        clock: &'a A,
+    ) -> MuxMCTPDriver<'a, A, M> {
+        MuxMCTPDriver {
+            mctp_device,
+            next_msg_tag: Cell::new(0),
+            local_eid: Cell::new(local_eid),
+            mtu: Cell::new(mtu),
+            sender_list: List::new(),
+            receiver_list: List::new(),
+            tx_pkt_buffer: TakeCell::new(tx_pkt_buf),
+            rx_pkt_buffer: TakeCell::new(rx_pkt_buf),
+            clock,
+            deferred_call: DeferredCall::new(),
+        }
+    }
+
+    pub fn enable(&self) {
+        self.mctp_device.enable();
+    }
+
+    pub fn add_sender(&self, sender: &'a MCTPTxState<'a, A, M>) {
+        let list_empty = self.sender_list.head().is_none();
+
+        self.sender_list.push_tail(sender);
+
+        if list_empty {
+            self.deferred_call.set();
+        }
+    }
+
+    fn deferred_send(&self) {
+        if let Some(sender) = self.sender_list.head() {
+            self.send_next_packet(sender);
+        }
+    }
+
+    pub fn add_receiver(&self, receiver: &'a MCTPRxState<'a>) {
+        self.receiver_list.push_tail(receiver);
+    }
+
+    pub fn set_local_eid(&self, local_eid: u8) {
+        self.local_eid.set(local_eid);
+    }
+
+    pub fn set_mtu(&self, mtu: usize) {
+        self.mtu.set(mtu);
+    }
+
+    pub fn get_local_eid(&self) -> u8 {
+        self.local_eid.get()
+    }
+
+    pub fn get_mtu(&self) -> usize {
+        self.mtu.get()
+    }
+
+    pub fn get_next_msg_tag(&self) -> u8 {
+        let msg_tag = self.next_msg_tag.get();
+        self.next_msg_tag.set((msg_tag + 1) % 8);
+        msg_tag
+    }
+
+    fn interpret_packet(&self, packet: &[u8]) -> (MCTPHeader, Option<MessageType>, usize) {
+        let mut msg_type = None;
+
+        if packet.len() < MCTP_HDR_SIZE {
+            return (MCTPHeader::default(), None, 0);
+        }
+
+        let mctp_header = MCTPHeader(u32::from_le_bytes(
+            packet[0..MCTP_HDR_SIZE].try_into().unwrap_or([0u8; 4]),
+        ));
+
+        if mctp_header.hdr_version() != 1 {
+            return (MCTPHeader::default(), None, 0);
+        }
+
+        if mctp_header.som() == 1 {
+            if packet.len() < MCTP_HDR_SIZE + 1 {
+                return (MCTPHeader::default(), None, 0);
+            }
+            msg_type = Some((packet[MCTP_HDR_SIZE] & 0x7F).into());
+        }
+        (mctp_header, msg_type, MCTP_HDR_SIZE)
+    }
+
+    fn fill_mctp_hdr_resp(
+        &self,
+        mctp_hdr_resp: MCTPHeader,
+        resp_buf: &mut [u8],
+    ) -> Result<(), ErrorCode> {
+        if resp_buf.len() < MCTP_HDR_SIZE {
+            return Err(ErrorCode::INVAL);
+        }
+        resp_buf[0..MCTP_HDR_SIZE].copy_from_slice(&mctp_hdr_resp.0.to_le_bytes());
+        Ok(())
+    }
+
+    fn process_mctp_control_msg(
+        &self,
+        mctp_hdr: MCTPHeader,
+        msg_buf: &[u8],
+    ) -> Result<(), ErrorCode> {
+        let mctp_hdr_resp = MCTPHeader::new(
+            mctp_hdr.src_eid(),
+            mctp_hdr.dest_eid(),
+            1,
+            1,
+            0,
+            0,
+            mctp_hdr.msg_tag(),
+        );
+
+        let mctp_hdr_start = self.mctp_hdr_offset();
+        let mctp_ctrl_hdr_start = mctp_hdr_start + MCTP_HDR_SIZE;
+        let (advertised_msg_types, advertised_msg_types_count) =
+            supported_msg_types(|msg_type| self.is_msg_type_registered(msg_type));
+        let advertised_msg_types = &advertised_msg_types[..advertised_msg_types_count];
+
+        self.tx_pkt_buffer
+            .take()
+            .map_or(Err(ErrorCode::NOMEM), |resp_buf| {
+                let result = process_mctp_control_msg(
+                    msg_buf,
+                    self.get_local_eid(),
+                    advertised_msg_types,
+                    &mut resp_buf[mctp_ctrl_hdr_start..],
+                );
+
+                match result {
+                    Ok(control_resp) => {
+                        if let Some(eid) = control_resp.assigned_eid {
+                            self.set_local_eid(eid);
+                        }
+
+                        let res = self.fill_mctp_hdr_resp(
+                            mctp_hdr_resp,
+                            &mut resp_buf[mctp_hdr_start..mctp_hdr_start + MCTP_HDR_SIZE],
+                        );
+
+                        match res {
+                            Ok(_) => {
+                                let resp_len = MCTP_HDR_SIZE + control_resp.resp_len;
+                                match self.mctp_device.transmit(resp_buf, resp_len) {
+                                    Ok(_) => Ok(()),
+                                    Err((err, tx_buf)) => {
+                                        self.tx_pkt_buffer.replace(tx_buf);
+                                        Err(err)
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                self.tx_pkt_buffer.replace(resp_buf);
+                                Err(e)
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.tx_pkt_buffer.replace(resp_buf);
+                        Err(e)
+                    }
+                }
+            })
+    }
+
+    fn send_next_packet(&self, cur_sender: &'a MCTPTxState<'a, A, M>) {
+        let mut tx_pkt = SubSliceMut::new(self.tx_pkt_buffer.take().unwrap());
+        let mctp_hdr_offset = self.mctp_hdr_offset();
+        let pkt_end_offset = self.get_mtu();
+
+        // set the window of the subslice for MCTP header and the payload
+        tx_pkt.slice(mctp_hdr_offset..pkt_end_offset);
+
+        match cur_sender.fill_next_packet(&mut tx_pkt, self.local_eid.get()) {
+            Ok(len) => {
+                tx_pkt.reset();
+                match self
+                    .mctp_device
+                    .transmit(tx_pkt.take(), len + mctp_hdr_offset)
+                {
+                    Ok(_) => (),
+                    Err((err, buf)) => {
+                        capsule_error!("MCTP-MUX", "Failed to transmit: 0x{:x}", err as u32);
+                        self.tx_pkt_buffer.replace(buf);
+                    }
+                }
+            }
+            Err(err) => {
+                capsule_error!("MCTP-MUX", "Failed to start transmit: 0x{:x}", err as u32);
+                self.tx_pkt_buffer.replace(tx_pkt.take());
+            }
+        }
+    }
+
+    fn process_first_packet(
+        &self,
+        mctp_hdr: MCTPHeader,
+        msg_type: MessageType,
+        pkt_payload: &[u8],
+    ) {
+        // Check if the first packet of a multi-packet message has at least length of
+        // MCTP_BASELINE_TRANSMISSION_UNIT bytes.
+        if mctp_hdr.eom() == 0 && pkt_payload.len() < MCTP_BASELINE_TRANSMISSION_UNIT {
+            capsule_debug!(
+                "MCTP",
+                "Received first packet with less than 64 bytes. Dropping packet."
+            );
+            return;
+        }
+
+        let rx_state = self
+            .receiver_list
+            .iter()
+            .find(|rx_state| rx_state.is_receive_expected(msg_type));
+
+        if let Some(rx_state) = rx_state {
+            let recv_time = self.clock.now().into_u32();
+            rx_state.start_receive(mctp_hdr, msg_type, pkt_payload, recv_time);
+        } else {
+            capsule_debug!(
+                "MCTP",
+                "No matching receive request found. Dropping packet."
+            );
+        }
+    }
+
+    #[inline(never)]
+    fn process_packet(&self, mctp_hdr: MCTPHeader, pkt_payload: &[u8]) {
+        if self.local_eid != mctp_hdr.dest_eid().into() {
+            capsule_debug!("MCTP-MUX", "Packet not for this Endpoint. Dropping packet.");
+            return;
+        }
+
+        if mctp_hdr.eom() != 1 && pkt_payload.len() < MCTP_BASELINE_TRANSMISSION_UNIT {
+            capsule_debug!(
+                "MCTP",
+                "Received first or middle packet with less than 64 bytes. Dropping packet."
+            );
+            return;
+        }
+
+        let rx_state = self
+            .receiver_list
+            .iter()
+            .find(|rx_state| rx_state.is_next_packet(mctp_hdr, pkt_payload.len()));
+
+        if let Some(rx_state) = rx_state {
+            let recv_time = self.clock.now().into_u32();
+            rx_state.receive_next(mctp_hdr, pkt_payload, recv_time);
+        } else {
+            capsule_debug!(
+                "MCTP",
+                "No matching receive request found. Dropping packet."
+            );
+        }
+    }
+
+    fn mctp_hdr_offset(&self) -> usize {
+        self.mctp_device.get_hdr_size()
+    }
+
+    fn is_msg_type_registered(&self, msg_type: MessageType) -> bool {
+        self.receiver_list
+            .iter()
+            .any(|rx_state| rx_state.msg_type() == msg_type)
+    }
+}
+
+impl<'a, A: Alarm<'a>, M: MCTPTransportBinding<'a>> TransportTxClient for MuxMCTPDriver<'a, A, M> {
+    fn send_done(&self, tx_buffer: &'static mut [u8], result: Result<(), ErrorCode>) {
+        self.tx_pkt_buffer.replace(tx_buffer);
+
+        let mut cur_sender = self.sender_list.head();
+        if let Some(sender) = cur_sender {
+            if sender.is_eom() || result.is_err() {
+                sender.send_done(result);
+                self.sender_list.pop_head();
+                cur_sender = self.sender_list.head();
+            }
+        }
+
+        if let Some(cur_sender) = cur_sender {
+            self.send_next_packet(cur_sender);
+        };
+    }
+}
+
+impl<'a, A: Alarm<'a>, M: MCTPTransportBinding<'a>> TransportRxClient for MuxMCTPDriver<'a, A, M> {
+    fn receive(&self, rx_buffer: &'static mut [u8], len: usize) {
+        if len == 0 || len > rx_buffer.len() {
+            capsule_debug!("MCTP-MUX", "Invalid packet length. Dropping packet.");
+            self.rx_pkt_buffer.replace(rx_buffer);
+            return;
+        }
+
+        let (mctp_header, msg_type, payload_offset) = self.interpret_packet(&rx_buffer[0..len]);
+        if let Some(msg_type) = msg_type {
+            match msg_type {
+                MessageType::MctpControl => {
+                    if mctp_header.tag_owner() == 1
+                        && mctp_header.som() == 1
+                        && mctp_header.eom() == 1
+                    {
+                        let _ = self
+                            .process_mctp_control_msg(mctp_header, &rx_buffer[payload_offset..len]);
+                    } else {
+                        capsule_debug!(
+                            "MCTP-MUX",
+                            "Invalid MCTP Control message. Dropping packet."
+                        );
+                    }
+                }
+                MessageType::Pldm
+                | MessageType::Spdm
+                | MessageType::SecureSpdm
+                | MessageType::Caliptra
+                | MessageType::TestMsgType => {
+                    self.process_first_packet(
+                        mctp_header,
+                        msg_type,
+                        &rx_buffer[payload_offset..len],
+                    );
+                }
+                _ => {
+                    capsule_debug!("MCTP-MUX", "Unsupported message type. Dropping packet.");
+                }
+            }
+        } else {
+            self.process_packet(mctp_header, &rx_buffer[payload_offset..len]);
+        }
+        self.rx_pkt_buffer.replace(rx_buffer);
+    }
+
+    fn write_expected(&self) {
+        if let Some(rx_buf) = self.rx_pkt_buffer.take() {
+            self.mctp_device.set_rx_buffer(rx_buf);
+        };
+    }
+}
+
+impl<'a, A: Alarm<'a>, M: MCTPTransportBinding<'a>> DeferredCallClient for MuxMCTPDriver<'a, A, M> {
+    fn handle_deferred_call(&self) {
+        self.deferred_send();
+    }
+
+    fn register(&'static self) {
+        self.deferred_call.register(self);
+    }
+}

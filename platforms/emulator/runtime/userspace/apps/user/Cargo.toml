@@ -1,0 +1,142 @@
+# Licensed under the Apache-2.0 license
+
+[package]
+name = "user-app"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[dependencies]
+arrayvec.workspace = true
+async-trait.workspace = true
+caliptra-api.workspace = true
+constant_time_eq.workspace = true
+critical-section.workspace = true
+embassy-executor.workspace = true
+embassy-sync.workspace = true
+caliptra-mcu-common-commands.workspace = true
+caliptra-mcu-libapi-caliptra.workspace = true
+caliptra-mcu-libapi-emulated-caliptra.workspace = true
+caliptra-mcu-libsyscall-caliptra.workspace = true
+caliptra-mcu-libtock_console.workspace = true
+caliptra-mcu-libtock_low_level_debug.workspace = true
+caliptra-mcu-libtock_platform.workspace = true
+caliptra-mcu-libtock_runtime.workspace = true
+caliptra-mcu-libtock = { workspace = true, features = ["no_panic_handler"] }
+caliptra-mcu-libtockasync.workspace = true
+caliptra-mcu-config.workspace = true
+caliptra-mcu-config-emulator.workspace = true
+caliptra-mcu-config-fpga.workspace = true
+caliptra-mcu-mbox-lib.workspace = true
+caliptra-mcu-mbox-common.workspace = true
+caliptra-mcu-mctp-vdm-common.workspace = true
+caliptra-mcu-mctp-vdm-lib.workspace = true
+portable-atomic.workspace = true
+caliptra-mcu-pldm-common.workspace = true
+caliptra-mcu-pldm-lib.workspace = true
+mcu-error.workspace = true
+caliptra-mcu-romtime.workspace = true
+mcu-caliptra-api-lite.workspace = true
+caliptra-mcu-spdm-codec.workspace = true
+caliptra-mcu-spdm-pal.workspace = true
+caliptra-mcu-spdm-stack = { workspace = true }
+caliptra-mcu-spdm-transports.workspace = true
+caliptra-mcu-spdm-traits.workspace = true
+caliptra-mcu-spdm-vdm-handler.workspace = true
+static_cell.workspace = true
+zerocopy.workspace = true
+
+[target.'cfg(not(target_arch = "riscv32"))'.dependencies]
+caliptra-mcu-libtock_unittest.workspace = true
+
+[target.'cfg(target_arch = "riscv32")'.dependencies]
+embassy-executor = { version = "0.9.1", features = ["arch-riscv32"] }
+embedded-alloc.workspace = true
+portable-atomic = { workspace = true, features = ["critical-section"] }
+defmt = { workspace = true, optional = true }
+caliptra-mcu-userlog = { workspace = true, optional = true }
+
+[build-dependencies]
+caliptra-ocp-eat.workspace = true
+
+[features]
+default = []
+hw-2-1 = []
+ocp-lock = []
+doe = []
+userspace-log = ["dep:defmt", "dep:caliptra-mcu-userlog"]
+# Production / minimal-size build for user-app.  Activated automatically by
+# `xtask runtime-build --profile release` (via `--features release` forwarded
+# through the bundler).  Gates `console_writeln!` to a no-op so all of
+# user-app's informational and diagnostic output (including the `{:?}` Debug
+# format paths) is stripped, and forwards to `caliptra-mcu-romtime/no-print`
+# so the romtime `print!`/`println!` macros become no-ops inside user-app's
+# private dependency build of `caliptra-mcu-romtime`.
+release = [
+    "caliptra-mcu-romtime/no-print",
+    "caliptra-mcu-libsyscall-caliptra/release",
+]
+test-caliptra-certs = []
+test-caliptra-crypto = []
+test-caliptra-mailbox = []
+test-caliptra-util-host-validator = []
+test-defmt-logging-mailbox = ["userspace-log"]
+test-defmt-logging-vdm = ["userspace-log"]
+test-doe-transport-loopback = []
+test-doe-discovery = []
+test-doe-user-loopback = []
+test-doe-spdm-responder-conformance = []
+test-do-nothing = []
+test-exit-immediately = []
+test-external-otp = []
+test-get-device-state = []
+test-i3c-simple = []
+test-i3c-constant-writes = []
+test-flash-based-boot = []
+test-flash-ctrl-init = []
+test-flash-ctrl-read-write-page = []
+test-flash-ctrl-erase-page = []
+test-flash-storage-read-write = []
+test-flash-storage-erase = []
+test-flash-usermode = []
+test-log-flash-circular = []
+test-log-flash-linear = []
+test-log-flash-usermode = []
+test-firmware-update-flash = []
+test-firmware-update-streaming = []
+test-fpga-flash-ctrl = []
+test-mbox-sram = []
+test-mci = []
+test-mctp-ctrl-cmds = []
+test-mctp-capsule-loopback = []
+test-mctp-user-loopback = []
+test-mctp-vdm-cmds = []
+test-caliptra-util-host-mctp-vdm-validator = []
+test-mcu-mbox-driver = []
+test-mcu-mbox-soc-requester-loopback = []
+test-mcu-mbox-usermode = []
+test-mcu-mbox-cmds = []
+test-mcu-mbox-fips-self-test = []
+test-mcu-rom-flash-access = []
+test-mcu-svn-gt-fuse = []
+test-mcu-svn-lt-fuse = []
+test-ocp-lock = ["caliptra-mcu-libapi-caliptra/ocp-lock"]
+test-handoff = ["caliptra-mcu-libapi-caliptra/ocp-lock"]
+test-pldm-request-response = []
+test-pldm-discovery = []
+test-pldm-fw-update = []
+test-pldm-fw-update-e2e = []
+test-pldm-streaming-boot = []
+test-streaming-boot-flash-write-back = []
+test-mctp-spdm-attestation = []
+test-mctp-spdm-attestation-pcr-quote = []
+test-mctp-spdm-responder-conformance = []
+# Test-only SPDM SET_CERTIFICATE path. Enables flash-backed certificate
+# installation without production authorization/key-binding.
+test-mctp-spdm-set-certificate = [
+  "caliptra-mcu-spdm-pal/set-certificate",
+  "caliptra-mcu-spdm-stack/set-certificate",
+]
+test-doe-spdm-tdisp-ide-validator = []
+test-mcu-mbox-fips-periodic = ["caliptra-mcu-mbox-lib/periodic-fips-self-test"]
+active-i3c1 = []

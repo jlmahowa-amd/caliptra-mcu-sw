@@ -1,0 +1,562 @@
+// Licensed under the Apache-2.0 license
+
+use crate::control_context::Tid;
+use caliptra_mcu_pldm_common::message::firmware_update::get_status::GetStatusReasonCode;
+use caliptra_mcu_pldm_common::protocol::firmware_update::{
+    FirmwareDeviceState, PldmFdTime, UpdateOptionFlags, PLDM_FWUP_MAX_PADDING_SIZE,
+};
+use caliptra_mcu_pldm_common::util::fw_component::FirmwareComponent;
+use core::cell::RefCell;
+
+/// Result of prepare_download_request batch operation
+pub struct DownloadRequestInfo {
+    pub instance_id: u8,
+    pub is_complete: bool,
+    pub result: Option<u8>,
+    pub component: FirmwareComponent,
+    pub chunk_info: Option<(u32, u32)>, // (offset, length)
+}
+
+pub struct FdInternal {
+    inner: RefCell<FdInternalInner>,
+}
+
+pub struct FdInternalInner {
+    // Current state of the firmware device.
+    state: FirmwareDeviceState,
+
+    // Previous state of the firmware device.
+    prev_state: FirmwareDeviceState,
+
+    // Reason for the last transition to the idle state.
+    // Only valid when `state == FirmwareDeviceState::Idle`.
+    reason: Option<GetStatusReasonCode>,
+
+    // Details of the component currently being updated.
+    // Set by `UpdateComponent`, available during download/verify/apply.
+    update_comp: FirmwareComponent,
+
+    // Flags indicating update options.
+    update_flags: UpdateOptionFlags,
+
+    // Maximum transfer size allowed by the UA or platform implementation.
+    max_xfer_size: u32,
+
+    // Request details used for download/verify/apply operations.
+    req: FdReq,
+
+    // Mode-specific data for the requester.
+    initiator_mode_state: InitiatorModeState,
+
+    // Address of the Update Agent (UA).
+    _ua_address: Option<Tid>,
+
+    // Timestamp for FD T1 timeout in milliseconds.
+    fd_t1_update_ts: PldmFdTime,
+
+    fd_t1_timeout: PldmFdTime,
+    fd_t2_retry_time: PldmFdTime,
+}
+
+impl Default for FdInternal {
+    fn default() -> Self {
+        Self::new(
+            crate::config::FD_MAX_XFER_SIZE as u32,
+            crate::config::DEFAULT_FD_T1_TIMEOUT,
+            crate::config::DEFAULT_FD_T2_RETRY_TIME,
+        )
+    }
+}
+
+impl FdInternal {
+    pub fn new(
+        max_xfer_size: u32,
+        fd_t1_timeout: PldmFdTime,
+        fd_t2_retry_time: PldmFdTime,
+    ) -> Self {
+        Self {
+            inner: RefCell::new(FdInternalInner::new(
+                max_xfer_size,
+                fd_t1_timeout,
+                fd_t2_retry_time,
+            )),
+        }
+    }
+
+    pub fn is_update_mode(&self) -> bool {
+        let inner = self.inner.borrow();
+        inner.state != FirmwareDeviceState::Idle
+    }
+
+    pub fn set_fd_state(&self, state: FirmwareDeviceState) {
+        let mut inner = self.inner.borrow_mut();
+        if inner.state != state {
+            inner.prev_state = inner.state.clone();
+            inner.state = state;
+        }
+    }
+
+    pub fn set_fd_idle(&self, reason_code: GetStatusReasonCode) {
+        let mut inner = self.inner.borrow_mut();
+        if inner.state != FirmwareDeviceState::Idle {
+            inner.prev_state = inner.state.clone();
+            inner.state = FirmwareDeviceState::Idle;
+            inner.reason = Some(reason_code);
+        }
+    }
+
+    pub fn fd_idle_timeout(&self) {
+        let state = self.get_fd_state();
+        let reason = match state {
+            FirmwareDeviceState::Idle => return,
+            FirmwareDeviceState::LearnComponents => GetStatusReasonCode::LearnComponentTimeout,
+            FirmwareDeviceState::ReadyXfer => GetStatusReasonCode::ReadyXferTimeout,
+            FirmwareDeviceState::Download => GetStatusReasonCode::DownloadTimeout,
+            FirmwareDeviceState::Verify => GetStatusReasonCode::VerifyTimeout,
+            FirmwareDeviceState::Apply => GetStatusReasonCode::ApplyTimeout,
+            FirmwareDeviceState::Activate => GetStatusReasonCode::ActivateFw,
+        };
+
+        self.set_fd_idle(reason);
+    }
+
+    pub fn get_fd_reason(&self) -> Option<GetStatusReasonCode> {
+        let inner = self.inner.borrow();
+        inner.reason
+    }
+
+    pub fn get_fd_state(&self) -> FirmwareDeviceState {
+        let inner = self.inner.borrow();
+        inner.state.clone()
+    }
+
+    pub fn get_fd_prev_state(&self) -> FirmwareDeviceState {
+        let inner = self.inner.borrow();
+        inner.prev_state.clone()
+    }
+
+    pub fn set_xfer_size(&self, transfer_size: usize) {
+        let mut inner = self.inner.borrow_mut();
+        inner.max_xfer_size = transfer_size as u32;
+    }
+
+    pub fn get_xfer_size(&self) -> usize {
+        let inner = self.inner.borrow();
+        inner.max_xfer_size as usize
+    }
+
+    pub fn set_component(&self, comp: &FirmwareComponent) {
+        let mut inner = self.inner.borrow_mut();
+        inner.update_comp = comp.clone();
+    }
+
+    pub fn get_component(&self) -> FirmwareComponent {
+        let inner = self.inner.borrow();
+        inner.update_comp.clone()
+    }
+
+    pub fn set_update_flags(&self, flags: UpdateOptionFlags) {
+        let mut inner = self.inner.borrow_mut();
+        inner.update_flags = flags;
+    }
+
+    pub fn get_update_flags(&self) -> UpdateOptionFlags {
+        let inner = self.inner.borrow();
+        inner.update_flags
+    }
+
+    pub fn set_fd_req(
+        &self,
+        req_state: FdReqState,
+        complete: bool,
+        result: Option<u8>,
+        instance_id: Option<u8>,
+        command: Option<u8>,
+        sent_time: Option<PldmFdTime>,
+    ) {
+        let mut inner = self.inner.borrow_mut();
+        inner.req = FdReq {
+            state: req_state,
+            complete,
+            result,
+            instance_id,
+            command,
+            sent_time,
+        };
+    }
+
+    pub fn alloc_next_instance_id(&self) -> Option<u8> {
+        let mut inner = self.inner.borrow_mut();
+        inner.req.instance_id = Some(
+            inner
+                .req
+                .instance_id
+                .map_or(1, |id| (id + 1) % crate::config::INSTANCE_ID_COUNT),
+        );
+        inner.req.instance_id
+    }
+
+    pub fn get_fd_req(&self) -> FdReq {
+        let inner = self.inner.borrow();
+        inner.req.clone()
+    }
+
+    pub fn get_fd_req_state(&self) -> FdReqState {
+        let inner = self.inner.borrow();
+        inner.req.state.clone()
+    }
+
+    pub fn set_fd_req_state(&self, state: FdReqState) {
+        let mut inner = self.inner.borrow_mut();
+        inner.req.state = state;
+    }
+
+    pub fn get_fd_sent_time(&self) -> Option<PldmFdTime> {
+        let inner = self.inner.borrow();
+        inner.req.sent_time
+    }
+
+    pub fn is_fd_req_complete(&self) -> bool {
+        let inner = self.inner.borrow();
+        inner.req.complete
+    }
+
+    pub fn get_fd_req_result(&self) -> Option<u8> {
+        let inner = self.inner.borrow();
+        inner.req.result
+    }
+
+    pub fn get_fd_download_chunk(
+        &self,
+        requested_offset: u32,
+        requested_length: u32,
+    ) -> Option<(u32, u32)> {
+        let inner = self.inner.borrow();
+        if inner.state != FirmwareDeviceState::Download {
+            return None;
+        }
+
+        let comp_image_size = inner.update_comp.comp_image_size.unwrap_or(0);
+        if requested_offset > comp_image_size
+            || requested_offset
+                .checked_add(requested_length)
+                .is_none_or(|requested_end| {
+                    comp_image_size
+                        .checked_add(PLDM_FWUP_MAX_PADDING_SIZE as u32)
+                        .is_some_and(|allowed_end| requested_end > allowed_end)
+                })
+        {
+            return None;
+        }
+        let chunk_size = requested_length.min(inner.max_xfer_size);
+        Some((requested_offset, chunk_size))
+    }
+
+    pub fn get_fd_download_state(&self) -> Option<(u32, u32)> {
+        let inner = self.inner.borrow();
+        if let InitiatorModeState::Download(download) = &inner.initiator_mode_state {
+            Some((download.offset, download.length))
+        } else {
+            None
+        }
+    }
+
+    pub fn set_fd_download_state(&self, offset: u32, length: u32) {
+        let mut inner = self.inner.borrow_mut();
+        if let InitiatorModeState::Download(download) = &mut inner.initiator_mode_state {
+            download.offset = offset;
+            download.length = length;
+        }
+    }
+
+    pub fn set_initiator_mode(&self, mode: InitiatorModeState) {
+        let mut inner = self.inner.borrow_mut();
+        inner.initiator_mode_state = mode;
+    }
+
+    pub fn set_fd_verify_progress(&self, progress: u8) {
+        let mut inner = self.inner.borrow_mut();
+        if let InitiatorModeState::Verify(verify) = &mut inner.initiator_mode_state {
+            verify.progress_percent = progress;
+        }
+    }
+
+    pub fn set_fd_apply_progress(&self, progress: u8) {
+        let mut inner = self.inner.borrow_mut();
+        if let InitiatorModeState::Apply(apply) = &mut inner.initiator_mode_state {
+            apply.progress_percent = progress;
+        }
+    }
+
+    pub fn get_fd_verify_progress(&self) -> Option<u8> {
+        let inner = self.inner.borrow();
+        if let InitiatorModeState::Verify(verify) = &inner.initiator_mode_state {
+            Some(verify.progress_percent)
+        } else {
+            None
+        }
+    }
+
+    pub fn get_fd_apply_progress(&self) -> Option<u8> {
+        let inner = self.inner.borrow();
+        if let InitiatorModeState::Apply(apply) = &inner.initiator_mode_state {
+            Some(apply.progress_percent)
+        } else {
+            None
+        }
+    }
+
+    pub fn set_fd_t1_update_ts(&self, timestamp: PldmFdTime) {
+        let mut inner = self.inner.borrow_mut();
+        inner.fd_t1_update_ts = timestamp;
+    }
+
+    pub fn get_fd_t1_update_ts(&self) -> PldmFdTime {
+        let inner = self.inner.borrow();
+        inner.fd_t1_update_ts
+    }
+
+    pub fn set_fd_t1_timeout(&self, timeout: PldmFdTime) {
+        let mut inner = self.inner.borrow_mut();
+        inner.fd_t1_timeout = timeout;
+    }
+
+    pub fn get_fd_t1_timeout(&self) -> PldmFdTime {
+        let inner = self.inner.borrow();
+        inner.fd_t1_timeout
+    }
+
+    /// Batch operation for preparing a download request.
+    /// Combines multiple mutex acquisitions into one for better performance.
+    /// Returns: (instance_id, is_complete, result, component, chunk_info)
+    /// where chunk_info is Some((offset, length)) if in download state
+    pub fn prepare_download_request(
+        &self,
+        requested_offset: u32,
+        requested_length: u32,
+    ) -> Option<DownloadRequestInfo> {
+        let mut inner = self.inner.borrow_mut();
+
+        // Check if we should send (equivalent to should_send_fd_request check for req state)
+        if inner.req.state != FdReqState::Ready {
+            return None;
+        }
+
+        // Allocate next instance ID
+        inner.req.instance_id = Some(
+            inner
+                .req
+                .instance_id
+                .map_or(1, |id| (id + 1) % crate::config::INSTANCE_ID_COUNT),
+        );
+        let instance_id = inner.req.instance_id?;
+
+        // Check if request is complete
+        let is_complete = inner.req.complete;
+        let result = inner.req.result;
+
+        // Get component (clone to return)
+        let component = inner.update_comp.clone();
+
+        // Get download chunk info if in download state
+        let chunk_info = if inner.state == FirmwareDeviceState::Download && !is_complete {
+            let comp_image_size = inner.update_comp.comp_image_size.unwrap_or(0);
+            if requested_offset <= comp_image_size {
+                let chunk_size = requested_length.min(inner.max_xfer_size);
+                Some((requested_offset, chunk_size))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        Some(DownloadRequestInfo {
+            instance_id,
+            is_complete,
+            result,
+            component,
+            chunk_info,
+        })
+    }
+
+    /// Batch operation to finalize a download request after encoding.
+    /// Sets the download state and request state in a single lock.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finalize_download_request(
+        &self,
+        chunk_offset: u32,
+        chunk_length: u32,
+        instance_id: u8,
+        command: u8,
+        sent_time: PldmFdTime,
+        is_complete: bool,
+        result: Option<u8>,
+    ) {
+        let mut inner = self.inner.borrow_mut();
+
+        // Set download state
+        if let InitiatorModeState::Download(download) = &mut inner.initiator_mode_state {
+            download.offset = chunk_offset;
+            download.length = chunk_length;
+        }
+
+        // Set request state
+        inner.req = FdReq {
+            state: FdReqState::Sent,
+            complete: is_complete,
+            result,
+            instance_id: Some(instance_id),
+            command: Some(command),
+            sent_time: Some(sent_time),
+        };
+    }
+
+    pub fn set_fd_t2_retry_time(&self, retry_time: PldmFdTime) {
+        let mut inner = self.inner.borrow_mut();
+        inner.fd_t2_retry_time = retry_time;
+    }
+
+    pub fn get_fd_t2_retry_time(&self) -> PldmFdTime {
+        let inner = self.inner.borrow();
+        inner.fd_t2_retry_time
+    }
+
+    /// Create a transfer session by capturing current state.
+    /// This is used to avoid mutex acquisitions during the hot download path.
+    pub fn create_transfer_session(
+        &self,
+        now: PldmFdTime,
+    ) -> super::transfer_session::TransferSession {
+        let inner = self.inner.borrow();
+        super::transfer_session::TransferSession::new(
+            inner.max_xfer_size,
+            inner.update_comp.clone(),
+            inner.fd_t1_timeout,
+            inner.fd_t2_retry_time,
+            inner.req.instance_id.unwrap_or(0),
+            now,
+        )
+    }
+
+    /// Sync state from a transfer session back to internal state.
+    /// Called at the end of a download or periodically for progress updates.
+    pub fn sync_from_transfer_session(&self, session: &super::transfer_session::TransferSession) {
+        let mut inner = self.inner.borrow_mut();
+        inner.req.instance_id = Some(session.instance_id);
+        inner.req.state = session.req_state.clone();
+        inner.req.complete = session.complete;
+        inner.req.result = session.result.map(|r| r as u8);
+        inner.req.sent_time = session.sent_time;
+        inner.fd_t1_update_ts = session.fd_t1_update_ts;
+        if let InitiatorModeState::Download(ref mut download) = inner.initiator_mode_state {
+            download.offset = session.offset;
+            download.length = session.length;
+        }
+    }
+}
+
+impl Default for FdInternalInner {
+    fn default() -> Self {
+        Self::new(
+            crate::config::FD_MAX_XFER_SIZE as u32,
+            crate::config::DEFAULT_FD_T1_TIMEOUT,
+            crate::config::DEFAULT_FD_T2_RETRY_TIME,
+        )
+    }
+}
+
+impl FdInternalInner {
+    fn new(max_xfer_size: u32, fd_t1_timeout: u64, fd_t2_retry_time: u64) -> Self {
+        Self {
+            state: FirmwareDeviceState::Idle,
+            prev_state: FirmwareDeviceState::Idle,
+            reason: None,
+            update_comp: FirmwareComponent::default(),
+            update_flags: UpdateOptionFlags(0),
+            max_xfer_size,
+            req: FdReq::new(),
+            initiator_mode_state: InitiatorModeState::Download(DownloadState::default()),
+            _ua_address: None,
+            fd_t1_update_ts: 0,
+            fd_t1_timeout,
+            fd_t2_retry_time,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FdReqState {
+    // The `pldm_fd_req` instance is unused.
+    Unused,
+    // Ready to send a request.
+    Ready,
+    // Waiting for a response.
+    Sent,
+    // Completed and failed; will not send more requests.
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+pub struct FdReq {
+    // The current state of the request.
+    pub state: FdReqState,
+
+    // Indicates if the request is complete and ready to transition to the next state.
+    // This is relevant for TransferComplete, VerifyComplete, and ApplyComplete requests.
+    pub complete: bool,
+
+    // The result of the request, only valid when `complete` is set.
+    pub result: Option<u8>,
+
+    // The instance ID of the request, only valid in the `SENT` state.
+    pub instance_id: Option<u8>,
+
+    // The command associated with the request, only valid in the `SENT` state.
+    pub command: Option<u8>,
+
+    // The time when the request was sent, only valid in the `SENT` state.
+    pub sent_time: Option<PldmFdTime>,
+}
+
+impl Default for FdReq {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FdReq {
+    fn new() -> Self {
+        Self {
+            state: FdReqState::Unused,
+            complete: false,
+            result: None,
+            instance_id: None,
+            command: None,
+            sent_time: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum InitiatorModeState {
+    Download(DownloadState),
+    Verify(VerifyState),
+    Apply(ApplyState),
+}
+
+#[derive(Debug, Default)]
+pub struct DownloadState {
+    pub offset: u32,
+    pub length: u32,
+}
+
+#[derive(Debug, Default)]
+pub struct VerifyState {
+    pub progress_percent: u8,
+}
+
+#[derive(Debug, Default)]
+pub struct ApplyState {
+    pub progress_percent: u8,
+}

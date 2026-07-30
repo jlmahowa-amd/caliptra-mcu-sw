@@ -1,0 +1,77 @@
+//! Licensed under the Apache-2.0 license
+
+//! This module tests the imaginary flash controller on FPGA.
+
+#[cfg(feature = "fpga_realtime")]
+#[cfg(test)]
+pub mod test {
+    use crate::test::{finish_runtime_hw_model, start_runtime_hw_model, TestParams, TEST_LOCK};
+    use caliptra_mcu_hw_model::{flash_ctrl::ImaginaryFlashController, McuHwModel};
+    use caliptra_mcu_registers_generated::mci;
+    use caliptra_mcu_romtime::StaticRef;
+    use caliptra_mcu_testing_common::sleep_emulator_ticks;
+    use caliptra_mcu_testing_common::wait_for_runtime_start;
+    use random_port::PortPicker;
+    use std::process::exit;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    pub fn test_imaginary_flash_controller() {
+        let feature = "test-fpga-flash-ctrl";
+        let lock = TEST_LOCK.lock().unwrap();
+        lock.fetch_add(1, Ordering::Relaxed);
+        let feature = feature.replace("_", "-");
+
+        let mut hw = start_runtime_hw_model(TestParams {
+            feature: Some(&feature),
+            i3c_port: Some(PortPicker::new().random(true).pick().unwrap()),
+            ..Default::default()
+        });
+
+        hw.start_i3c_controller();
+
+        let mci_ptr = hw.base.mmio.mci().unwrap().ptr as u64;
+        run_imaginary_flash_controller_service(mci_ptr);
+
+        let test = finish_runtime_hw_model(&mut hw);
+
+        caliptra_mcu_testing_common::stop_emulator();
+
+        assert_eq!(0, test);
+
+        // force the compiler to keep the lock
+        lock.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn run_imaginary_flash_controller_service(mci_base: u64) {
+        run_imaginary_flash_controller_service_with_init(mci_base, None)
+    }
+
+    /// Variant that accepts initial flash content.
+    pub fn run_imaginary_flash_controller_service_with_init(
+        mci_base: u64,
+        initial_content: Option<Vec<u8>>,
+    ) {
+        caliptra_mcu_testing_common::spawn_with_emulator_state(move || {
+            wait_for_runtime_start();
+            if !caliptra_mcu_testing_common::is_emulator_running() {
+                exit(-1);
+            }
+            let mci_base = unsafe { StaticRef::new(mci_base as *const mci::regs::Mci) };
+
+            let flash_controller = ImaginaryFlashController::new(
+                mci_base,
+                Some(std::path::PathBuf::from("imaginary_flash_test.bin")),
+                initial_content.as_deref(),
+            );
+            println!("Imaginary flash IO processor thread starting");
+            loop {
+                if !caliptra_mcu_testing_common::is_emulator_running() {
+                    break;
+                }
+                flash_controller.process_flash_ios();
+                sleep_emulator_ticks(1_000);
+            }
+        });
+    }
+}

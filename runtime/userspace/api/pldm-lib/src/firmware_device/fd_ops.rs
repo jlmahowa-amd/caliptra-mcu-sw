@@ -1,0 +1,247 @@
+// Licensed under the Apache-2.0 license
+
+extern crate alloc;
+use alloc::boxed::Box;
+use async_trait::async_trait;
+use caliptra_mcu_libsyscall_caliptra::DefaultSyscalls;
+use caliptra_mcu_pldm_common::message::firmware_update::apply_complete::ApplyResult;
+use caliptra_mcu_pldm_common::message::firmware_update::get_status::ProgressPercent;
+use caliptra_mcu_pldm_common::message::firmware_update::request_cancel::{
+    NonFunctioningComponentBitmap, NonFunctioningComponentIndication,
+};
+use caliptra_mcu_pldm_common::message::firmware_update::transfer_complete::TransferResult;
+use caliptra_mcu_pldm_common::message::firmware_update::verify_complete::VerifyResult;
+use caliptra_mcu_pldm_common::util::fw_component::FirmwareComponent;
+use caliptra_mcu_pldm_common::{
+    message::firmware_update::get_fw_params::FirmwareParameters,
+    protocol::firmware_update::{ComponentResponseCode, Descriptor, PldmFdTime},
+};
+use mcu_error::{McuErrorCode, McuResult};
+
+use crate::timer::AsyncAlarm;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ComponentOperation {
+    PassComponent,
+    UpdateComponent,
+}
+
+/// Trait for firmware device-specific operations.
+///
+/// This trait defines asynchronous methods for performing various firmware device operations,
+/// including retrieving device identifiers, firmware parameters, and transfer sizes. It also
+/// provides methods for handling firmware components, managing firmware data downloads, verifying
+/// and applying firmware, activating new firmware, and obtaining the current timestamp.
+#[async_trait(?Send)]
+pub trait FdOps {
+    /// Asynchronously retrieves device identifiers.
+    ///
+    /// # Arguments
+    ///
+    /// * `device_identifiers` - A mutable slice of `Descriptor` to store the retrieved device identifiers.
+    ///
+    /// # Returns
+    ///
+    /// * `McuResult<usize>` - On success, returns the number of device identifiers retrieved.
+    ///   On failure, returns an `McuErrorCode`.
+    fn get_device_identifiers(&self, device_identifiers: &mut [Descriptor]) -> McuResult<usize>;
+
+    /// Asynchronously retrieves firmware parameters.
+    ///
+    /// # Arguments
+    ///
+    /// * `firmware_params` - A mutable reference to `FirmwareParameters` to store the retrieved firmware parameters.
+    ///
+    /// # Returns
+    ///
+    /// * `McuResult<()>` - On success, returns `Ok(())`. On failure, returns an `McuErrorCode`.
+    fn get_firmware_parms(&self, firmware_params: &mut FirmwareParameters) -> McuResult<()>;
+
+    /// Retrieves the transfer size for the firmware update operation.
+    ///
+    /// # Arguments
+    ///
+    /// * `ua_transfer_size` - The requested transfer size in bytes.
+    ///
+    /// # Returns
+    ///
+    /// * `McuResult<usize>` - On success, returns the transfer size in bytes.
+    ///   On failure, returns an `McuErrorCode`.
+    async fn get_xfer_size(&self, ua_transfer_size: usize) -> McuResult<usize>;
+
+    /// Handles firmware component operations such as passing or updating components.
+    ///
+    /// # Arguments
+    ///
+    /// * `component` - A reference to the `FirmwareComponent` to be processed.
+    /// * `fw_params` - A reference to the `FirmwareParameters` associated with the operation.
+    /// * `op` - The `ComponentOperation` to be performed (e.g., pass or update).
+    ///
+    /// # Returns
+    ///
+    /// * `McuResult<ComponentResponseCode>` - On success, returns a `ComponentResponseCode`.
+    ///   On failure, returns an `McuErrorCode`.
+    fn handle_component(
+        &self,
+        component: &FirmwareComponent,
+        fw_params: &FirmwareParameters,
+        op: ComponentOperation,
+    ) -> McuResult<ComponentResponseCode>;
+
+    /// Queries the download offset and length for a given firmware component.
+    ///
+    /// # Arguments
+    ///
+    /// * `component` - A reference to the `FirmwareComponent` for which the download offset and length are queried.
+    ///
+    /// # Returns
+    ///
+    /// * `McuResult<(usize, usize)>` - On success, returns a tuple containing the offset and length in bytes.
+    ///   On failure, returns an `McuErrorCode`.
+    async fn query_download_offset_and_length(
+        &self,
+        component: &FirmwareComponent,
+    ) -> McuResult<(usize, usize)>;
+
+    /// Handles firmware data downloading operations.
+    ///
+    /// # Arguments
+    ///
+    /// * `offset` - The offset in bytes where the firmware data should be written or processed.
+    /// * `data` - A slice of bytes representing the firmware data to be handled.
+    /// * `component` - A reference to the `FirmwareComponent` associated with the firmware data.
+    ///
+    /// # Returns
+    ///
+    /// * `McuResult<TransferResult>` - On success, returns a `TransferResult` indicating the outcome of the operation.
+    ///   On failure, returns an `McuErrorCode`.
+    async fn download_fw_data(
+        &self,
+        offset: usize,
+        data: &[u8],
+        component: &FirmwareComponent,
+    ) -> McuResult<TransferResult>;
+
+    /// Checks if the firmware download for a given component is complete.
+    ///
+    /// # Arguments
+    ///
+    /// * `component` - A reference to the `FirmwareComponent` for which the download completion status is checked.
+    ///
+    /// # Returns
+    ///
+    /// * `bool` - Returns `true` if the download is complete, otherwise `false`.
+    fn is_download_complete(&self, component: &FirmwareComponent) -> bool;
+
+    /// Queries the download progress for a given firmware component.
+    ///
+    /// # Arguments
+    ///
+    /// * `component` - A reference to the `FirmwareComponent` for which the download progress is queried.
+    /// * `progress_percent` - A mutable reference to `ProgressPercent` to track the download progress.
+    ///
+    /// # Returns
+    ///
+    /// * `McuResult<()>` - On success, returns `Ok(())`. On failure, returns an `McuErrorCode`.
+    fn query_download_progress(
+        &self,
+        component: &FirmwareComponent,
+        progress_percent: &mut ProgressPercent,
+    ) -> McuResult<()>;
+
+    /// Verifies the firmware component.
+    ///
+    /// # Arguments
+    ///
+    /// * `component` - A reference to the `FirmwareComponent` to be verified.
+    /// * `progress_percent` - A mutable reference to `ProgressPercent` to track the verification progress.
+    ///
+    /// # Returns
+    ///
+    /// * `McuResult<VerifyResult>` - On success, returns a `VerifyResult` indicating the outcome of the verification.
+    /// *   On failure, returns an `McuErrorCode`.
+    async fn verify(
+        &self,
+        component: &FirmwareComponent,
+        progress_percent: &mut ProgressPercent,
+    ) -> McuResult<VerifyResult>;
+
+    /// Applies the firmware component.
+    ///
+    /// # Arguments
+    ///
+    /// * `component` - A reference to the `FirmwareComponent` to be applied.
+    /// * `progress_percent` - A mutable reference to `ProgressPercent` to track the application progress.
+    ///
+    /// # Returns
+    ///
+    /// * `McuResult<ApplyResult>` - On success, returns an `ApplyResult` indicating the outcome of the application.
+    /// *   On failure, returns an `McuErrorCode`.
+    async fn apply(
+        &self,
+        component: &FirmwareComponent,
+        progress_percent: &mut ProgressPercent,
+    ) -> McuResult<ApplyResult>;
+
+    /// Activates new firmware.
+    ///
+    /// # Arguments
+    ///
+    /// * `self_contained_activation` - Indicates if self-contained activation is requested.
+    /// * `estimated_time` - A mutable reference to store the estimated time (in seconds)
+    ///   required to perform self-activation. This may be left as `None` if not needed.
+    ///
+    /// # Returns
+    ///
+    /// * `McuResult<u8>` - On success, returns a PLDM completion code.
+    ///   On failure, returns an `McuErrorCode`.
+    ///
+    /// The device implementation is responsible for verifying that the expected components
+    /// have been updated. If not, it should return `PLDM_FWUP_INCOMPLETE_UPDATE`.
+    fn activate(&self, self_contained_activation: u8, estimated_time: &mut u16) -> McuResult<u8>;
+
+    /// Cancels the update operation for a specific firmware component.
+    ///
+    /// # Arguments
+    ///
+    /// * `component` - A reference to the `FirmwareComponent` for which the update operation should be canceled.
+    ///
+    /// # Returns
+    ///
+    /// * `McuResult<()>` - On success, returns `Ok(())`. On failure, returns an `McuErrorCode`.
+    fn cancel_update_component(&self, component: &FirmwareComponent) -> McuResult<()>;
+
+    /// Indicates which components will be in a non-functioning state upon exiting update mode
+    /// due to cancel update request from UA.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<(NonFunctioningComponentIndication, NonFunctioningComponentBitmap), McuErrorCode>` -
+    ///   On success, returns a tuple containing:
+    ///     - `NonFunctioningComponentIndication`: Indicates whether components are functioning or not.
+    ///     - `NonFunctioningComponentBitmap`: A bitmap representing non-functioning components.
+    ///   On failure, returns an `McuErrorCode`.
+    async fn get_non_functional_component_info(
+        &self,
+    ) -> Result<
+        (
+            NonFunctioningComponentIndication,
+            NonFunctioningComponentBitmap,
+        ),
+        McuErrorCode,
+    > {
+        Ok((
+            NonFunctioningComponentIndication::ComponentsFunctioning,
+            NonFunctioningComponentBitmap::new(0),
+        ))
+    }
+
+    /// Retrieves the current timestamp in milliseconds.
+    ///
+    /// # Returns
+    ///
+    /// * `PldmFdTime` - The current timestamp in milliseconds.
+    fn now(&self) -> PldmFdTime {
+        AsyncAlarm::<DefaultSyscalls>::get_milliseconds().unwrap()
+    }
+}

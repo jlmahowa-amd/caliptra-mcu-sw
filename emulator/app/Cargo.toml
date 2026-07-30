@@ -1,0 +1,77 @@
+# Licensed under the Apache-2.0 license
+
+[package]
+name = "caliptra-mcu-emulator"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bitfield.workspace = true
+caliptra-emu-bus.workspace = true
+caliptra-emu-cpu.workspace = true
+caliptra-emu-periph.workspace = true
+caliptra-mcu-core-util-host-mailbox-test-config.workspace = true
+caliptra-mcu-core-mailbox-server.workspace = true
+caliptra-emu-types.workspace = true
+caliptra-api-types.workspace = true
+caliptra-hw-model-types.workspace = true
+caliptra-image-types = { workspace = true, features = ["std"] }
+caliptra-registers.workspace = true
+chrono.workspace = true
+clap.workspace = true
+clap-num.workspace = true
+crc.workspace = true
+crossterm.workspace = true
+ctrlc.workspace = true
+ecdsa.workspace = true
+elf.workspace = true
+caliptra-mcu-emulator-bmc.workspace = true
+caliptra-mcu-emulator-caliptra.workspace = true
+caliptra-mcu-emulator-consts.workspace = true
+caliptra-mcu-emulator-mcu-mbox.workspace = true
+caliptra-mcu-emulator-periph.workspace = true
+caliptra-mcu-emulator-registers-generated.workspace = true
+gdbstub_arch.workspace = true
+gdbstub.workspace = true
+hex.workspace = true
+log.workspace = true
+lazy_static.workspace = true
+caliptra-mcu-config.workspace = true
+caliptra-mcu-config-emulator.workspace = true
+caliptra-mcu-mbox-common.workspace = true
+caliptra-mcu-testing-common.workspace = true
+caliptra-mcu-otp-lifecycle.workspace = true
+p384.workspace = true
+caliptra-mcu-pldm-common.workspace = true
+caliptra-mcu-pldm-fw-pkg.workspace = true
+caliptra-mcu-pldm-ua.workspace = true
+rand.workspace = true
+caliptra-mcu-registers-generated.workspace = true
+sec1.workspace = true
+sha2.workspace = true
+semver.workspace = true
+simple_logger.workspace = true
+smlang.workspace = true
+strum_macros.workspace = true
+strum.workspace = true
+tempfile.workspace = true
+tock-registers.workspace = true
+uuid.workspace = true
+zerocopy.workspace = true
+
+[dev-dependencies]
+caliptra-test.workspace = true
+
+[[bin]]
+name = "caliptra-mcu-emulator"
+path = "src/main.rs"
+
+[lib]
+name = "caliptra_mcu_emulator"
+path = "src/lib.rs"
+
+[features]
+default = ["ocp-lock"]
+ocp-lock = []

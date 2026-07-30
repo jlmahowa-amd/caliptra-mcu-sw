@@ -1,0 +1,34 @@
+// Licensed under the Apache-2.0 license
+
+use caliptra_mcu_config::flash::FlashPartition;
+
+pub const DRIVER_NUM_EMULATED_FLASH_CTRL: usize = 0x8000_0012;
+pub const BLOCK_SIZE: usize = 64 * 1024;
+
+pub const STAGING_PARTITION: FlashPartition = FlashPartition {
+    name: "staging_par",
+    offset: 0x0000_0000,
+    size: (BLOCK_SIZE * 0x200),
+    driver_num: DRIVER_NUM_EMULATED_FLASH_CTRL as u32,
+};
+
+pub const EMULATED_EXT_OTP_PARTITION: FlashPartition = FlashPartition {
+    name: "emulated_ext_otp",
+    offset: STAGING_PARTITION.offset + STAGING_PARTITION.size,
+    size: (BLOCK_SIZE * 0x8),
+    driver_num: 0x7000_000B,
+};
+
+#[macro_export]
+macro_rules! flash_partition_list_imaginary_flash {
+    ($macro:ident) => {{
+        $macro!(0, staging_par, STAGING_PARTITION);
+    }};
+}
+
+pub const LOGGING_PARTITION: FlashPartition = FlashPartition {
+    name: "logging",
+    offset: 0x03FF_8000,
+    size: 32 * 1024,
+    driver_num: 0x9001_0000,
+};

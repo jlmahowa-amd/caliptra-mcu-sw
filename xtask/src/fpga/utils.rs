@@ -1,0 +1,527 @@
+// Licensed under the Apache-2.0 license
+
+use anyhow::{bail, Context, Result};
+use cargo_metadata::MetadataCommand;
+
+use std::path::Path;
+
+use std::{
+    path::PathBuf,
+    process::{Command, Stdio},
+};
+
+use caliptra_mcu_builder::PROJECT_ROOT;
+
+const BUILDER_IMAGE: &str = "ghcr.io/chipsalliance/caliptra-builder:latest";
+
+/// Check that host system has all the tools that the xtask FPGA flows depends on.
+pub fn check_host_dependencies() -> Result<()> {
+    if Container::try_new().is_err() {
+        bail!("Neither 'podman' nor 'docker' found on PATH. Please install one of them.");
+    }
+    let tools = [
+        (
+            "rsync --version",
+            "'rsync' not found on PATH. Please install rsync.",
+        ),
+        (
+            "cargo-nextest --version",
+            "'cargo-nextest' not found on PATH. Please install with `cargo install cargo-nextest`.",
+        ),
+    ];
+    check_dependencies(None, &tools)
+}
+
+/// Check that FPGA  has all the tools that the xtask FPGA flows depends on.
+pub fn check_fpga_dependencies(target_host: Option<&str>) -> Result<()> {
+    let tools = [
+        (
+            "rsync --version",
+            "'rsync' not found on FPGA PATH. Please install rsync on FPGA.",
+        ),
+        (
+            "cargo-nextest --version",
+            "'cargo-nextest' not found on FPGA PATH. Please install with `cargo install cargo-nextest` on FPGA.",
+        ),
+    ];
+    check_dependencies(target_host, &tools)
+}
+
+fn check_dependencies(target_host: Option<&str>, tools: &[(&str, &str)]) -> Result<()> {
+    for (command, error_msg) in tools {
+        if run_command_extended(RunCommandArgs {
+            target_host,
+            command,
+            output: Output::Silence,
+        })
+        .is_err()
+        {
+            let error_msg = error_msg.to_string();
+            bail!(error_msg);
+        }
+    }
+    Ok(())
+}
+
+/// Copies a file to FPGA over rsync to the FPGA home folder.
+pub fn rsync_file(target_host: &str, file: &str, dest_file: &str, from_fpga: bool) -> Result<()> {
+    // TODO(clundin): We assume are files are dropped in the root / home folder. May want to find a
+    // put things in their own directory.
+    let copy = if from_fpga {
+        format!("{target_host}:{file}")
+    } else {
+        format!("{target_host}:{dest_file}")
+    };
+    let args = if from_fpga {
+        ["-avxz", &copy, "."]
+    } else {
+        ["-avxz", file, &copy]
+    };
+    let status = Command::new("rsync")
+        .current_dir(&*PROJECT_ROOT)
+        .args(args)
+        .status()?;
+    if !status.success() {
+        bail!("failed rsync file: {file} to {target_host}");
+    }
+    Ok(())
+}
+
+/// Runs a command over SSH if `target_host` is `Some`. Otherwise runs command on current machine.
+/// Captures output of command and returns it as a string
+pub fn run_command_with_output(target_host: Option<&str>, command: &str) -> Result<String> {
+    let res = run_command_extended(RunCommandArgs {
+        target_host,
+        command,
+        output: Output::Capture,
+    })?;
+    if let Some(output) = res {
+        Ok(output)
+    } else {
+        bail!("Missing command output for command: '{command}'")
+    }
+}
+
+/// Runs a command over SSH if `target_host` is `Some`. Otherwise runs command on current machine.
+pub fn run_command(target_host: Option<&str>, command: &str) -> Result<()> {
+    let _ = run_command_extended(RunCommandArgs {
+        target_host,
+        command,
+        ..Default::default()
+    })?;
+    Ok(())
+}
+
+#[derive(Default, PartialEq)]
+pub enum Output {
+    Silence,
+    Capture,
+    #[default]
+    Inherit,
+}
+
+#[derive(Default)]
+pub struct RunCommandArgs<'a> {
+    pub target_host: Option<&'a str>,
+    pub command: &'a str,
+    pub output: Output,
+}
+
+/// Runs a command over SSH if `target_host` is `Some`. Otherwise runs command on current machine.
+/// Set `silence_output` to true to avoid outputting command logs.
+pub fn run_command_extended(args: RunCommandArgs) -> Result<Option<String>> {
+    let mut command = if let Some(target_host) = args.target_host {
+        if args.output != Output::Silence {
+            println!("[FPGA] Running command: {}", args.command);
+        }
+        let mut cmd = Command::new("ssh");
+        cmd.current_dir(&*PROJECT_ROOT).args([
+            "-o",
+            "ConnectTimeout=5",
+            target_host,
+            "-t",
+            args.command,
+        ]);
+        cmd
+    } else {
+        if args.output != Output::Silence {
+            println!("[HOST] Running command: {}", args.command);
+        }
+        let mut cmd = Command::new("sh");
+        cmd.current_dir(&*PROJECT_ROOT).args(["-c", args.command]);
+        cmd
+    };
+
+    match args.output {
+        Output::Capture => {
+            let output = command.output()?;
+            Ok(Some(String::from_utf8(output.stdout)?))
+        }
+        Output::Silence => {
+            let status = command
+                .stdout(Stdio::null())
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .status()?;
+            if !status.success() {
+                bail!("Failed to run command");
+            }
+            Ok(None)
+        }
+        Output::Inherit => {
+            let status = command
+                .stdout(Stdio::inherit())
+                .stdin(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .status()?;
+            if !status.success() {
+                bail!("Failed to run command");
+            }
+            Ok(None)
+        }
+    }
+}
+
+pub struct NextestArchiveCommand {
+    work_dir: String,
+    features: Vec<String>,
+    package_filter: Option<String>,
+}
+
+impl NextestArchiveCommand {
+    pub fn new(work_dir: &str) -> Self {
+        Self {
+            work_dir: work_dir.into(),
+            features: vec![],
+            package_filter: None,
+        }
+    }
+
+    pub fn feature(mut self, feature: &str) -> Self {
+        self.features.push(feature.into());
+        self
+    }
+
+    pub fn features(mut self, features: &[&str]) -> Self {
+        for f in features {
+            self.features.push(f.to_string());
+        }
+        self
+    }
+
+    pub fn package_filter(mut self, filter: Option<&str>) -> Self {
+        self.package_filter = filter.map(|s| s.into());
+        self
+    }
+
+    pub fn build(self) -> String {
+        let mut cmd = format!("cd {} && ", self.work_dir);
+        cmd.push_str("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc ");
+        cmd.push_str("cargo nextest archive ");
+
+        if !self.features.is_empty() {
+            cmd.push_str(&format!("--features={} ", self.features.join(",")));
+        }
+
+        if let Some(filter) = self.package_filter {
+            cmd.push_str(&format!("-E '{}' ", filter));
+        }
+
+        cmd.push_str("--target=aarch64-unknown-linux-gnu ");
+        cmd.push_str("--release ");
+        cmd.push_str("--archive-file=/work-dir/caliptra-test-binaries.tar.zst ");
+        cmd.push_str("--target-dir cross-target/");
+
+        cmd
+    }
+}
+
+pub struct Container {
+    cmd: Command,
+}
+
+impl Container {
+    pub fn try_new() -> Result<Self> {
+        let program = if run_command_extended(RunCommandArgs {
+            command: "podman --version",
+            output: Output::Silence,
+            ..Default::default()
+        })
+        .is_ok()
+        {
+            "podman"
+        } else if run_command_extended(RunCommandArgs {
+            command: "docker --version",
+            output: Output::Silence,
+            ..Default::default()
+        })
+        .is_ok()
+        {
+            "docker"
+        } else {
+            bail!("Host needs either podman or Docker installed!");
+        };
+
+        println!("Checking for build image updates");
+        Command::new(program)
+            .arg("pull")
+            .arg(BUILDER_IMAGE)
+            .output()
+            .context("Failed to pull new builder image")?;
+
+        Ok(Self {
+            cmd: Command::new(program),
+        })
+    }
+
+    pub fn run(&mut self) -> &mut Self {
+        self.cmd.arg("run");
+        self
+    }
+
+    pub fn rm(&mut self) -> &mut Self {
+        self.cmd.arg("--rm");
+        self
+    }
+
+    pub fn env(&mut self, key: &str, val: &str) -> &mut Self {
+        self.cmd.arg("-e").arg(format!("{key}={val}"));
+        self
+    }
+
+    pub fn volume(&mut self, src: &str, dest: &str) -> &mut Self {
+        self.cmd.arg("-v").arg(format!("{src}:{dest}"));
+        self
+    }
+
+    pub fn workdir(&mut self, dir: &str) -> &mut Self {
+        self.cmd.arg("-w").arg(dir);
+        self
+    }
+
+    pub fn arg(&mut self, arg: &str) -> &mut Self {
+        self.cmd.arg(arg);
+        self
+    }
+
+    pub fn setup_build_env(&mut self) -> Result<&mut Self> {
+        let home = std::env::var("HOME").unwrap();
+        let project_root = PROJECT_ROOT.clone();
+        let project_root = project_root.display();
+
+        self.run()
+            .rm()
+            .env("TERM", "xterm-256color")
+            .volume(&project_root.to_string(), "/work-dir")
+            .workdir("/work-dir")
+            .volume(&format!("{home}/.cargo/registry"), "/root/.cargo/registry")
+            .volume(&format!("{home}/.cargo/git"), "/root/.cargo/git");
+
+        let caliptra_sw = caliptra_sw_workspace_root();
+        let caliptra_path = caliptra_sw.canonicalize()?;
+        let basename = caliptra_sw.file_name().unwrap().to_str().unwrap();
+        let display = caliptra_path.display();
+        self.volume(&display.to_string(), &format!("/{basename}"));
+        self.arg(BUILDER_IMAGE).arg("/bin/bash").arg("-c");
+        Ok(self)
+    }
+
+    pub fn status(&mut self) -> Result<std::process::ExitStatus, std::io::Error> {
+        self.cmd.status()
+    }
+}
+
+/// create a base container command
+pub fn build_base_container_command() -> Result<Container> {
+    let mut container = Container::try_new()?;
+    container.setup_build_env()?;
+    Ok(container)
+}
+
+pub fn run_test_suite(
+    test_dir: &str,
+    prelude: &str,
+    test_filters: Option<Vec<&str>>,
+    test_output: &str,
+    target_host: Option<&str>,
+    default_test_profile: &str,
+) -> Result<()> {
+    // Prefer an unpacked binaries directory (set by CI via TEST_BIN or
+    // CPTRA_TEST_BIN_DIR); fall back to a tar.zst archive for local runs.
+    let bin_dir = std::env::var("CPTRA_TEST_BIN_DIR")
+        .or_else(|_| std::env::var("TEST_BIN"))
+        .ok();
+    let binaries_args = if let Some(dir) = bin_dir.as_deref() {
+        format!(
+            "--cargo-metadata={dir}/target/nextest/cargo-metadata.json \
+             --binaries-metadata={dir}/target/nextest/binaries-metadata.json \
+             --target-dir-remap={dir}/target \
+             --workspace-remap=. "
+        )
+    } else {
+        let archive = std::env::var("CPTRA_TEST_ARCHIVE")
+            .unwrap_or_else(|_| "$HOME/caliptra-test-binaries.tar.zst".to_string());
+        format!("--workspace-remap=. --archive-file {archive} ")
+    };
+    // Allow CI (which runs xtask from the repo root) to override the cd target.
+    let workspace = std::env::var("CPTRA_TEST_WORKSPACE").unwrap_or_else(|_| test_dir.to_string());
+    // --status-level=all emits STARTING lines so a hung test is visible in the
+    // streamed log even if nextest never reports a PASS/FAIL.
+    let mut test_command = format!(
+        "(cd {workspace} && \
+                sudo {prelude} \
+                cargo-nextest nextest run \
+                {binaries_args}\
+                {test_output} --no-fail-fast --status-level=all "
+    );
+    if let Some(filters) = test_filters {
+        test_command += "--profile=nightly ";
+        for filter in filters {
+            test_command += format!("-E \"{filter}\" ").as_str();
+        }
+    } else {
+        test_command += format!("--profile={default_test_profile} ").as_str();
+    }
+    test_command += ")";
+    // Keep the result so logs are still copied on failure, but surface a
+    // non-zero exit to the caller so download / extract / nextest failures
+    // fail the CI step.
+    let test_result = run_command(target_host, test_command.as_str());
+    if let Some(target_host) = target_host {
+        println!("Copying test log from FPGA to junit.xml");
+        rsync_file(target_host, "/tmp/junit.xml", ".", true)?;
+    }
+    test_result?;
+    Ok(())
+}
+
+/// Checks if any caliptra_sw dependencies are a local path.
+///
+/// If so, returns the Path to the caliptra_sw workspace root.
+pub fn caliptra_sw_workspace_root() -> PathBuf {
+    let metadata = MetadataCommand::new().exec().unwrap();
+
+    // Look at the workspace dependencies for xtask and find a caliptra-sw crate.
+    // Check if the crate contains a path, that indicates that caliptra-sw is local.
+    //
+    // We have to look at workspace, otherwise `path` may not be set (opposed to looking at the
+    // local xtask dependencies).
+    let caliptra_path = metadata
+        .workspace_packages()
+        .iter()
+        .find(|p| p.name.as_ref() == "xtask")
+        .and_then(|xtask| {
+            xtask
+                .dependencies
+                .iter()
+                .find(|p| p.name == "caliptra-api-types")
+        })
+        .and_then(|caliptra_package| caliptra_package.path.clone())
+        .and_then(|p| p.ancestors().nth(2).map(|p| p.to_path_buf()))
+        // Fallback to the git manifest if caliptra-sw doesn't appear to be local.
+        .or_else(|| {
+            let metadata = cargo_metadata::MetadataCommand::new().exec().unwrap();
+            let package = metadata
+                .packages
+                .iter()
+                .find(|p| p.name.to_string() == "caliptra-api-types")
+                .map(|p| p.manifest_path.clone())
+                .and_then(|p| p.ancestors().nth(3).map(|p| p.to_path_buf()));
+            package
+        });
+
+    match caliptra_path {
+        Some(path) => path.into(),
+        None => panic!("Could not determine caliptra-sw path"),
+    }
+}
+
+/// Download a bitstream from a Caliptra bitstream manifest
+pub fn download_bitstream<P: AsRef<Path>>(target_host: Option<&str>, manifest: P) -> Result<()> {
+    // Assumes bitstream file is placed in the current directory.
+    let bitstream = caliptra_bitstream_downloader::download_bitstream(manifest.as_ref())?;
+
+    if let Some(target_host) = target_host {
+        rsync_file(
+            target_host,
+            &bitstream.display().to_string(),
+            "caliptra-bitstream.pdi",
+            false,
+        )
+        .context("failed to copy tests to fpga")?;
+    } else {
+        std::fs::rename(&bitstream, "caliptra-bitstream.pdi").context("rename bitstream pdi")?;
+    }
+    Ok(())
+}
+
+/// Load a bitstream into the FPGA hardware.
+pub fn load_bitstream(target_host: Option<&str>) -> Result<()> {
+    run_command(target_host, "sudo mkdir -p /lib/firmware")?;
+    run_command(target_host, "sudo mv caliptra-bitstream.pdi /lib/firmware")?;
+    run_command(
+        target_host,
+        r#"sudo bash -c 'echo "caliptra-bitstream.pdi" > /sys/class/fpga_manager/fpga0/firmware'"#,
+    )?;
+    Ok(())
+}
+
+pub fn build_caliptra_firmware(caliptra_workspace: &PathBuf, fw_id: Option<&str>) -> Result<()> {
+    let fw_dir = PathBuf::from("/tmp/caliptra-test-firmware");
+    run_command(
+        None,
+        "mkdir -p /tmp/caliptra-test-firmware/caliptra-test-firmware",
+    )?;
+    let binaries = match fw_id {
+        None => caliptra_builder::firmware::REGISTERED_FW.to_vec(),
+        Some(fw_id) => caliptra_builder::firmware::REGISTERED_FW
+            .iter()
+            .cloned()
+            .filter(|&fw| fw.bin_name == fw_id)
+            .collect(),
+    };
+
+    for (fwid, elf_bytes) in
+        caliptra_builder::build_firmware_elfs_uncached(Some(caliptra_workspace), &binaries).unwrap()
+    {
+        let elf_filename = fwid.elf_filename();
+        std::fs::write(fw_dir.join(elf_filename), elf_bytes).unwrap();
+    }
+    Ok(())
+}
+
+pub fn check_ssh_access(target_host: Option<&str>) -> Result<()> {
+    if let Some(target_host) = target_host {
+        if run_command_extended(RunCommandArgs {
+            target_host: Some(target_host),
+            command: "true",
+            output: Output::Silence,
+        })
+        .is_err()
+        {
+            bail!(
+                "Could not ssh to '{target_host}'. Please check your ssh connection and settings."
+            );
+        };
+    }
+
+    Ok(())
+}
+
+/// Resolves the target host. Defaults to "caliptra-fpga" if available.
+pub fn resolve_target_host(target_host: Option<&str>) -> Option<String> {
+    if let Some(host) = target_host {
+        Some(host.to_string())
+    } else {
+        let default_host = "caliptra-fpga";
+        if check_ssh_access(Some(default_host)).is_ok() {
+            Some(default_host.to_string())
+        } else {
+            println!(
+                "Could not connect to default target '{}', falling back to local machine.",
+                default_host
+            );
+            None
+        }
+    }
+}
