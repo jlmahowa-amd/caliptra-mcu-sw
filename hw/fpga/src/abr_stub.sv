@@ -4,13 +4,20 @@
 // Used when STUB_ADAMS_BRIDGE is defined to skip compiling the full
 // adams-bridge submodule (~354 source files) for faster FPGA builds.
 // The MLDSA accelerator is non-functional; AHB reads return 0 / OKAY.
+//
+// Ports that use KV/PCR package types are flattened to plain logic so this
+// file compiles independently of package elaboration order.
+//   kv_read_t       = 9b  (KV_ENTRY_ADDR_W=5 + KV_ENTRY_SIZE_W=4)
+//   kv_write_t      = 51b (1+5+4+32+9)
+//   kv_wr_resp_t    = 1b
+//   kv_rd_resp_t    = 34b (1+1+32)
+//   pcr_signing_t   = 1152b ((16+12+8)*32)
 
 `ifdef STUB_ADAMS_BRIDGE
 
 // Minimal copies of the package parameters needed to size the interface.
 // Keep in sync with abr_params_pkg.sv if the real widths ever change.
 package abr_stub_params_pkg;
-  // abr_mem_if signal widths (from abr_params_pkg)
   localparam ABR_MEM_W1_ADDR_W    = 9;   // $clog2(512)
   localparam ABR_MEM_W1_DATA_W    = 4;
   localparam ABR_MEM_INST0_ADDR_W = 10;  // $clog2(832)
@@ -172,23 +179,29 @@ module abr_mem_top #(
     input  logic clk_i,
     abr_mem_if.resp abr_memory_export
 );
-    assign abr_memory_export.w1_mem_rdata_o        = '0;
+    assign abr_memory_export.w1_mem_rdata_o          = '0;
     assign abr_memory_export.mem_inst0_bank0_rdata_o = '0;
     assign abr_memory_export.mem_inst0_bank1_rdata_o = '0;
-    assign abr_memory_export.mem_inst1_rdata_o     = '0;
-    assign abr_memory_export.mem_inst2_rdata_o     = '0;
-    assign abr_memory_export.mem_inst3_rdata_o     = '0;
-    assign abr_memory_export.sk_mem_bank0_rdata_o  = '0;
-    assign abr_memory_export.sk_mem_bank1_rdata_o  = '0;
-    assign abr_memory_export.sig_z_mem_rdata_o     = '0;
-    assign abr_memory_export.pk_mem_rdata_o        = '0;
+    assign abr_memory_export.mem_inst1_rdata_o       = '0;
+    assign abr_memory_export.mem_inst2_rdata_o       = '0;
+    assign abr_memory_export.mem_inst3_rdata_o       = '0;
+    assign abr_memory_export.sk_mem_bank0_rdata_o    = '0;
+    assign abr_memory_export.sk_mem_bank1_rdata_o    = '0;
+    assign abr_memory_export.sig_z_mem_rdata_o       = '0;
+    assign abr_memory_export.pk_mem_rdata_o          = '0;
 endmodule
 
+// Flat port widths (no package imports needed):
+//   kv_read_t [2:0]   -> 3 * 9  = 27b
+//   kv_rd_resp_t [2:0]-> 3 * 34 = 102b
+//   kv_write_t        -> 51b
+//   kv_wr_resp_t      -> 1b
+//   pcr_signing_t     -> 1152b
 module abr_top #(
-    parameter bit MASKING_EN       = 1,
-    parameter     SRAM_LATENCY     = 1,
-    parameter     AHB_ADDR_WIDTH   = 32,
-    parameter     AHB_DATA_WIDTH   = 64,
+    parameter bit MASKING_EN        = 1,
+    parameter     SRAM_LATENCY      = 1,
+    parameter     AHB_ADDR_WIDTH    = 32,
+    parameter     AHB_DATA_WIDTH    = 64,
     parameter     CLIENT_DATA_WIDTH = 32
 ) (
     input  logic clk,
@@ -211,21 +224,21 @@ module abr_top #(
     output logic                       hreadyout_o,
     output logic [AHB_DATA_WIDTH-1:0]  hrdata_o,
 
-    output kv_read_t  [2:0] kv_read,
-    input  kv_rd_resp_t [2:0] kv_rd_resp,
-    output kv_write_t       kv_write,
-    input  kv_wr_resp_t     kv_wr_resp,
+    output logic [26:0]   kv_read,       // kv_read_t [2:0]
+    input  logic [101:0]  kv_rd_resp,    // kv_rd_resp_t [2:0]
+    output logic [50:0]   kv_write,      // kv_write_t
+    input  logic          kv_wr_resp,    // kv_wr_resp_t
 
-    input  pcr_signing_t    pcr_signing_data,
-    input  logic            ocp_lock_in_progress,
+    input  logic [1151:0] pcr_signing_data, // pcr_signing_t
+    input  logic          ocp_lock_in_progress,
 
-    input  logic            debugUnlock_or_scan_mode_switch,
+    input  logic          debugUnlock_or_scan_mode_switch,
 
-    output logic            busy_o,
-    output logic            error_intr,
-    output logic            notif_intr,
+    output logic          busy_o,
+    output logic          error_intr,
+    output logic          notif_intr,
 
-    abr_mem_if.req          abr_memory_export
+    abr_mem_if.req        abr_memory_export
 );
     assign NTT_trigger   = '0;
     assign PWM_trigger   = '0;
