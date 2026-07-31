@@ -20,6 +20,7 @@ set I3C_SCL_RATE_KHZ 1000
 set I3C_OUTSIDE FALSE
 set SEGMENTED FALSE
 set SEGMENTED_WRITE_NCR FALSE
+set STUB_ADAMS_BRIDGE TRUE
 # Simplistic processing of command line arguments to override defaults
 foreach arg $argv {
   regexp {(.*)=(.*)} $arg fullmatch option value

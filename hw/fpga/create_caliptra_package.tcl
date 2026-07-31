@@ -39,8 +39,15 @@ add_files [ glob $caliptrartlDir/src/riscv_core/veer_el2/rtl/*.sv ]
 add_files [ glob $caliptrartlDir/src/riscv_core/veer_el2/rtl/*/*.sv ]
 add_files [ glob $caliptrartlDir/src/riscv_core/veer_el2/rtl/*/*.v ]
 
-# Add Adam's Bridge
-source adams-bridge-files.tcl
+# Add Adam's Bridge (or stub for faster builds)
+if {$STUB_ADAMS_BRIDGE eq "TRUE"} {
+  puts "STUB_ADAMS_BRIDGE=TRUE: skipping full adams-bridge (~354 files), using stub"
+  lappend VERILOG_OPTIONS STUB_ADAMS_BRIDGE
+  set_property verilog_define $VERILOG_OPTIONS [current_fileset]
+  source adams-bridge-files-stub.tcl
+} else {
+  source adams-bridge-files.tcl
+}
 
 # Add Caliptra headers and packages
 add_files [ glob $caliptrartlDir/src/*/rtl/*.svh ]
