@@ -215,8 +215,15 @@ remove_files [ glob $caliptrartlDir/src/spi_host/rtl/*.sv ]
 add_files [ glob $fpgaDir/src/*.sv]
 add_files [ glob $fpgaDir/src/*.v]
 
-# Replace RAM with FPGA block ram
-remove_files [ glob $caliptrartlDir/src/ecc/rtl/ecc_ram_tdp_file.sv ]
+# Replace RAM with FPGA block ram (skipped when ECC is stubbed — no RAM to replace)
+if {$STUB_ECC eq "TRUE"} {
+  puts "STUB_ECC=TRUE: removing full ECC RTL, using stub"
+  lappend VERILOG_OPTIONS STUB_ECC
+  set_property verilog_define $VERILOG_OPTIONS [current_fileset]
+  remove_files [ glob $caliptrartlDir/src/ecc/rtl/*.sv ]
+} else {
+  remove_files [ glob $caliptrartlDir/src/ecc/rtl/ecc_ram_tdp_file.sv ]
+}
 
 # Replace caliptra_ss_top with version modified with faster I3C clocks
 file copy [ glob $ssrtlDir/src/integration/rtl/caliptra_ss_top.sv ] $outputDir/caliptra_ss_top.sv

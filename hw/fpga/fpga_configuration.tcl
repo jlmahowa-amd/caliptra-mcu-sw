@@ -21,6 +21,7 @@ set I3C_OUTSIDE FALSE
 set SEGMENTED FALSE
 set SEGMENTED_WRITE_NCR FALSE
 set STUB_ADAMS_BRIDGE TRUE
+set STUB_ECC TRUE
 # Simplistic processing of command line arguments to override defaults
 foreach arg $argv {
   regexp {(.*)=(.*)} $arg fullmatch option value
